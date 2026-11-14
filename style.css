@@ -274,3 +274,8 @@ td .badge { margin-left: 4px; vertical-align: 1px; }
 .unread-dot { color: var(--accent); font-size: 10px; margin-right: 5px; vertical-align: 2px; }
 .card.unread { border-left: 3px solid var(--accent); }
 .unread-btn { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+
+/* ---------- キーの重複・バックアップ ---------- */
+.badge.dup { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); font-weight: 600; }
+.panel .check { display: flex; align-items: center; gap: 6px; margin: 12px 0 0; font-size: 13px; color: var(--text); cursor: pointer; }
+.panel .note + .note { margin-top: 6px; }

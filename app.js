@@ -474,7 +474,8 @@ async function registerUser() {
 }
 
 async function refresh(force) {
-  const changed = await withLock(syncTicketsRaw);
+  let changed = await withLock(syncTicketsRaw);
+  if (await fixDuplicateKeys()) changed = true;
   const before = JSON.stringify([state.config, [...state.users]]);
   await loadConfig();
   await loadUsers();
@@ -557,6 +558,66 @@ async function setField(id, field, value) {
   refreshHistory();
 }
 
+/* ================= チケット番号の重複対策 ================= */
+
+/*
+ * 2人がほぼ同時に作成すると同じキーのチケットができる(ファイルは別なのでデータは失われない)。
+ * 同じキーの組は、作成が早いもの(同時刻なら id 順)がキーを持ち続け、残りは「作成者の端末だけ」が振り直す。
+ * 作成者だけが直すので、複数の端末が同じチケットを取り合って番号を振り直すことはない。
+ * 作成日時とタイトルが同じものは同期ドライブの競合コピーとみなし、振り直さずに ⚠ を出すだけにする。
+ */
+const byCreated = (a, b) => String(a.createdAt).localeCompare(String(b.createdAt)) || a.id.localeCompare(b.id);
+const isConflictCopy = (a, b) => a.createdAt === b.createdAt && a.title === b.title;
+const keyPrefix = (key) => String(key).replace(/-\d+$/, '');
+const maxNum = () => Math.max(0, ...[...state.tickets.values()].map((x) => Number(x.num) || 0));
+
+function duplicateGroups() {
+  const byKey = new Map();
+  for (const t of state.tickets.values()) {
+    const g = byKey.get(t.key) || [];
+    g.push(t);
+    byKey.set(t.key, g);
+  }
+  return [...byKey.values()].filter((g) => g.length > 1).map((g) => g.sort(byCreated));
+}
+
+/** 自分が作った重複チケットのキーを振り直す。振り直したら true。withLock の外から呼ぶこと */
+async function fixDuplicateKeys() {
+  const targets = [];
+  for (const g of duplicateGroups()) {
+    for (const t of g.slice(1)) {
+      if (t.reporter !== state.me.email) continue;
+      if (g.some((o) => o !== t && isConflictCopy(o, t))) continue;
+      targets.push(t);
+    }
+  }
+  let fixed = false;
+  for (const t of targets) {
+    const oldKey = t.key;
+    const renamed = await withLock(async () => {
+      await syncTicketsRaw();
+      const fresh = await readJson(state.dirs.tickets, t.id + '.json');
+      if (!fresh) return null;
+      normalizeTicket(fresh, t.id);
+      if (fresh.key !== oldKey) return null; // 別の端末で振り直し済み
+      const num = maxNum() + 1;
+      fresh.num = num;
+      fresh.key = `${keyPrefix(oldKey)}-${num}`;
+      fresh.history.push({ at: nowIso(), by: state.me.email, field: 'キー', from: oldKey, to: `${fresh.key}(番号の重複を自動で振り直し)` });
+      fresh.updatedAt = nowIso();
+      fresh.updatedBy = state.me.email;
+      await writeJson(state.dirs.tickets, t.id + '.json', fresh);
+      state.tickets.set(t.id, fresh);
+      return fresh;
+    });
+    if (!renamed) continue;
+    fixed = true;
+    log('ticket.renumber', renamed.key, `${oldKey} → ${renamed.key}`);
+    toast(`${oldKey} が他のチケットと重複していたため、${renamed.key} に振り直しました`);
+  }
+  return fixed;
+}
+
 /* ================= 関連チケット ================= */
 
 /*
@@ -622,7 +683,10 @@ function relIndex() {
       for (const r of o.relations) if (r.type === 'blocks') blocked.add(r.id);
     }
   }
-  relIndexCache = { children, blocked };
+  // キーが重複しているもの(作成が早い1件以外)。作成者の端末で振り直されるまで ⚠ を出す
+  const duplicated = new Set();
+  for (const g of duplicateGroups()) for (const t of g.slice(1)) duplicated.add(t.id);
+  relIndexCache = { children, blocked, duplicated };
   return relIndexCache;
 }
 
@@ -768,6 +832,126 @@ async function openAttachment(handle) {
   setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
 
+/* ================= バックアップ ================= */
+
+const BACKUP_FORMAT = 'ticket-board-backup';
+const SAFE_ID = /^[A-Za-z0-9._@-]+$/;
+
+const blobToBase64 = (blob) => new Promise((res, rej) => {
+  const r = new FileReader();
+  r.onload = () => res(String(r.result).replace(/^data:[^,]*,/, ''));
+  r.onerror = () => rej(r.error);
+  r.readAsDataURL(blob);
+});
+const base64ToBlob = (b64, type) => {
+  const bin = atob(String(b64));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: type || '' });
+};
+
+/** 添付の件数と合計サイズ(保存前の表示用) */
+async function attachmentStats() {
+  let count = 0, size = 0;
+  for (const t of state.tickets.values()) {
+    for (const f of await listAttachments(t.id)) { count++; size += f.size; }
+  }
+  return { count, size };
+}
+
+/** チケット・設定・メンバー(・添付)を1つの JSON にまとめて保存させる。操作ログは含めない */
+async function exportBackup(withAttachments) {
+  const tickets = [...state.tickets.values()].sort(byCreated);
+  const attachments = {};
+  let files = 0;
+  if (withAttachments) {
+    for (const t of tickets) {
+      const list = await listAttachments(t.id);
+      if (!list.length) continue;
+      attachments[t.id] = [];
+      for (const f of list) {
+        const file = await f.handle.getFile();
+        attachments[t.id].push({ name: f.name, type: file.type, data: await blobToBase64(file) });
+        files++;
+      }
+    }
+  }
+  const backup = {
+    format: BACKUP_FORMAT, version: 1, exportedAt: nowIso(), exportedBy: state.me.email,
+    config: state.config, tickets, users: [...state.users.values()], attachments,
+  };
+  const d = new Date();
+  const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
+  const url = URL.createObjectURL(new Blob([JSON.stringify(backup)], { type: 'application/json' }));
+  const a = h('a', { href: url, download: `ticket-board-backup-${stamp}.json` });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+  log('data.export', '', `チケット ${tickets.length} 件、添付 ${files} 件`);
+  toast(`バックアップを保存しました(チケット ${tickets.length} 件、添付 ${files} 件)`);
+}
+
+/**
+ * バックアップのチケットと添付を、今の保存先に「追加」する。上書きはしない。
+ * 同じ id のチケットは読み込まない。キーが重複するものは番号を振り直す。
+ * 設定とメンバーは取り込まない(読み込み先の設定を壊さないため)。
+ */
+async function importBackup(file) {
+  let data;
+  try { data = JSON.parse(await file.text()); } catch { data = null; }
+  if (!data || data.format !== BACKUP_FORMAT || !Array.isArray(data.tickets)) {
+    toast('Ticket Board のバックアップファイルではありません', true);
+    return;
+  }
+  const valid = data.tickets.filter((t) => t && typeof t === 'object' && typeof t.id === 'string' && SAFE_ID.test(t.id) && !/^\.+$/.test(t.id));
+  await withLock(syncTicketsRaw);
+  const toAdd = valid.filter((t) => !state.tickets.has(t.id));
+  const skipped = data.tickets.length - toAdd.length;
+  if (!toAdd.length) { toast(`読み込めるチケットがありません(${skipped} 件はすでにあるか、形式が正しくありません)`, true); return; }
+  if (!confirm(`チケット ${toAdd.length} 件を今のデータに追加します。${skipped ? `(${skipped} 件はすでにあるか形式が正しくないため読み込みません)` : ''}\n今あるチケットは上書きしません。キーが重複するものは番号を振り直します。\n\nよろしいですか?`)) return;
+
+  const added = await withLock(async () => {
+    await syncTicketsRaw();
+    // 振り直すのは読み込み先に既にあるキーとぶつかるものだけ。バックアップ内での重複(競合コピーなど)は
+    // そのまま持ち込み、ふだんの重複対策(fixDuplicateKeys)に任せる
+    const usedKeys = new Set([...state.tickets.values()].map((t) => t.key));
+    let max = Math.max(maxNum(), ...toAdd.map((t) => Number(t.num) || 0));
+    const out = [];
+    for (const src of toAdd) {
+      if (state.tickets.has(src.id)) continue;
+      const t = normalizeTicket(structuredClone(src), src.id);
+      if (usedKeys.has(t.key)) {
+        const oldKey = t.key;
+        t.num = ++max;
+        t.key = `${state.config.key}-${t.num}`;
+        t.history.push({ at: nowIso(), by: state.me.email, field: 'キー', from: oldKey, to: `${t.key}(バックアップの読み込み時に振り直し)` });
+      }
+      await writeJson(state.dirs.tickets, t.id + '.json', t);
+      state.tickets.set(t.id, t);
+      out.push(t);
+    }
+    return out;
+  });
+
+  let files = 0;
+  const atts = data.attachments && typeof data.attachments === 'object' ? data.attachments : {};
+  for (const t of added) {
+    const list = Array.isArray(atts[t.id]) ? atts[t.id] : [];
+    if (!list.length) continue;
+    const dir = await state.dirs.attachments.getDirectoryHandle(t.id, { create: true });
+    for (const f of list) {
+      const name = String(f && f.name || '').replace(/[\\/:*?"<>|]/g, '_');
+      if (!name || /^\.+$/.test(name) || typeof f.data !== 'string') continue;
+      await writeFile(dir, name, base64ToBlob(f.data, f.type));
+      files++;
+    }
+  }
+  log('data.import', '', `チケット ${added.length} 件、添付 ${files} 件`);
+  await refresh(true);
+  toast(`チケット ${added.length} 件と添付 ${files} 件を読み込みました`);
+}
+
 /* ================= 画面: 共通部分 ================= */
 
 function renderChrome() {
@@ -845,6 +1029,7 @@ function progressBadges(t) {
   const kids = idx.children.get(t.id);
   const done = t.checklist.filter((c) => c.done).length;
   return [
+    idx.duplicated.has(t.id) ? h('span', { class: 'badge dup', title: '他のチケットとキーが重複しています。作成した人の画面で自動的に振り直されます。同期ドライブの競合コピーの場合は、内容を見比べて片方をアーカイブしてください' }, '⚠ 重複') : null,
     idx.blocked.has(t.id) ? h('span', { class: 'badge blocked', title: '未完了のチケットにブロックされています' }, '⛔') : null,
     t.checklist.length ? h('span', { class: 'badge' + (done === t.checklist.length ? ' ok' : ''), title: 'チェックリスト' }, `☑ ${done}/${t.checklist.length}`) : null,
     kids ? h('span', { class: 'badge' + (kids.done === kids.total ? ' ok' : ''), title: '子チケット(完了/全体)' }, `子 ${kids.done}/${kids.total}`) : null,
@@ -1049,7 +1234,36 @@ function viewSettings() {
       h('div', { class: 'toolbar' }, h('button', {
         class: 'btn',
         onclick: guard(async () => { await idbSet('root', null); lsSet('tb.mode', null); location.reload(); }),
-      }, '保存先フォルダを切り替える'))));
+      }, '保存先フォルダを切り替える'))),
+    backupPanel());
+}
+
+function backupPanel() {
+  const withAtt = h('input', { type: 'checkbox', checked: true });
+  const stats = h('span', { class: 'note' }, '(添付を数えています…)');
+  guard(async () => {
+    const s = await attachmentStats();
+    stats.textContent = `(添付 ${s.count} 件・合計 ${fmtSize(s.size)})`;
+  })();
+  const picker = h('input', {
+    type: 'file', accept: '.json,application/json', hidden: true,
+    onchange: guard(async (e) => {
+      const f = e.target.files[0];
+      e.target.value = '';
+      if (f) await importBackup(f);
+    }),
+  });
+  return h('div', { class: 'panel' },
+    h('h2', null, 'データのバックアップ'),
+    h('div', { class: 'note' },
+      'チケット・設定・メンバー・添付を1つのファイルに保存します(操作ログは含みません)。',
+      '読み込むと、今のデータにチケットを「追加」します。今あるチケットや設定は上書きしません。'),
+    h('div', { class: 'note' }, 'お試しモードのデータをチームのフォルダに移すには: お試しモードで「保存」→「保存先フォルダを切り替える」でフォルダに接続 → ここで「読み込み」。'),
+    h('label', { class: 'check' }, withAtt, '添付ファイルも含める ', stats),
+    h('div', { class: 'toolbar' },
+      h('button', { class: 'btn', onclick: guard(() => exportBackup(withAtt.checked)) }, 'バックアップを保存'),
+      h('button', { class: 'btn', onclick: () => picker.click() }, 'バックアップを読み込む'),
+      picker));
 }
 
 function profileForm(submitLabel, onSaved) {

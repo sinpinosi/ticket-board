@@ -197,6 +197,64 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   assert.strictEqual(await page.locator('.card').count(), 1);
   assert.ok((await page.locator('.card').innerText()).includes('2つ目'));
 
+  await page.uncheck('text=アーカイブを表示');
+
+  // 番号の重複: 自分が後から作った同じキーのチケットは自動で振り直される
+  const tk1 = await demoWrite({ key: 'TK-1', patch: {} });
+  await demoWrite({
+    op: 'put', fileId: 'TK-1-later',
+    ticket: { ...tk1, id: 'TK-1-later', title: 'あとから作成', createdAt: new Date(Date.now() + 1000).toISOString(), comments: [], checklist: [], history: [] },
+  });
+  await page.click('#btnSync');
+  await page.waitForSelector('#toast:has-text("振り直しました")');
+  assert.strictEqual(await page.locator('.card:has-text("あとから作成") .key').textContent(), 'TK-3');
+
+  // 同期ドライブの競合コピー(作成日時とタイトルが同じ)は振り直さず ⚠ を出すだけ
+  await demoWrite({ op: 'put', fileId: 'TK-1-copy', ticket: { ...tk1, id: 'TK-1-copy' } });
+  await page.click('#btnSync');
+  await page.waitForSelector('.badge.dup');
+  assert.strictEqual(await page.locator('.badge.dup').count(), 1);
+  assert.strictEqual(await page.locator('.card .key:text-is("TK-1")').count(), 2, '競合コピーのキーは変えない');
+
+  // バックアップ: 保存 → お試しのデータを全部消す → 読み込むと元に戻る
+  await page.click('#nav >> text=設定');
+  await page.waitForSelector('.panel:has-text("添付 2 件")');
+  const [download] = await Promise.all([page.waitForEvent('download'), page.click('text=バックアップを保存')]);
+  const backupPath = path.join(require('os').tmpdir(), `tb-backup-${Date.now()}.json`);
+  await download.saveAs(backupPath);
+  const backup = JSON.parse(require('fs').readFileSync(backupPath, 'utf8'));
+  assert.strictEqual(backup.format, 'ticket-board-backup');
+  assert.strictEqual(backup.tickets.length, 4);
+  assert.strictEqual(Object.values(backup.attachments).flat().length, 2);
+
+  await page.evaluate(() => new Promise((res, rej) => {
+    const r = indexedDB.open('ticket-board', 2);
+    r.onsuccess = () => { const tx = r.result.transaction('demo', 'readwrite'); tx.objectStore('demo').clear(); tx.oncomplete = res; tx.onerror = rej; };
+    r.onerror = rej;
+  }));
+  await page.reload();
+  await page.waitForSelector('.panel:has-text("データのバックアップ")');
+  await page.setInputFiles('.panel input[type=file]', backupPath);
+  await page.waitForSelector('#toast:has-text("読み込みました")');
+  require('fs').unlinkSync(backupPath);
+  await page.click('#nav >> text=ボード');
+  assert.strictEqual(await page.locator('.card').count(), 3, 'アーカイブ以外の3件が戻ること');
+  assert.strictEqual(await page.locator('.badge.dup').count(), 1, 'バックアップ内の競合コピーはそのまま持ち込むこと');
+  // 「ログイン画面」は元と競合コピーの2枚ある。添付は元のチケット(id ごと)にだけ戻る
+  const restored = [];
+  for (let i = 0; i < 2; i++) {
+    await page.click(`.card:has-text("ログイン画面") >> nth=${i}`);
+    await page.waitForSelector('.file-list li');
+    await page.waitForFunction(() => !document.querySelector('.file-list li.note') || !document.querySelector('.file-list li.note').textContent.includes('読み込み中'));
+    restored.push({
+      files: await page.locator('.file-list button.name').allTextContents(),
+      checklist: await page.locator('#dlg .checklist li').count(),
+    });
+    await closeDialog();
+  }
+  assert.ok(restored.some((r) => JSON.stringify(r.files) === JSON.stringify(['a (2).txt', 'a.txt'])), `添付が戻ること: ${JSON.stringify(restored)}`);
+  assert.ok(restored.every((r) => r.checklist === 2), 'チェックリストも戻ること');
+
   assert.deepStrictEqual(errors, [], 'ブラウザのエラーがないこと');
   await browser.close();
   console.log('OK: すべてのテストに成功しました');
