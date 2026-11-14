@@ -280,3 +280,15 @@ td .badge { margin-left: 4px; vertical-align: 1px; }
 .badge.dup { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); font-weight: 600; }
 .panel .check { display: flex; align-items: center; gap: 6px; margin: 12px 0 0; font-size: 13px; color: var(--text); cursor: pointer; }
 .panel .note + .note { margin-top: 6px; }
+
+/* ---------- プロジェクト・サブチケット ---------- */
+.chip.project { background: color-mix(in srgb, var(--ok) 15%, transparent); color: var(--ok); max-width: 12em; overflow: hidden; text-overflow: ellipsis; }
+.sub-list { margin-bottom: 6px; }
+.sub-list select { flex: none; width: auto; padding: 2px 4px; font-size: 12px; }
+.sub-list .unread-dot { margin-right: 0; }
+.sub-list li.archived .name { color: var(--muted); }
+.parent-link { display: flex; align-items: center; gap: 4px; min-width: 0; max-width: 45%; font-size: 12px; color: var(--muted); }
+.parent-link .keylink { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------- 警告(見つからないチケットなど) ---------- */
+.warn { color: var(--warn); font-size: 12px; font-weight: 600; }

@@ -17,7 +17,10 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   const errors = [];
   page.on('pageerror', (e) => errors.push(`pageerror: ${e.message}`));
   page.on('console', (m) => { if (m.type() === 'error') errors.push(`console: ${m.text()}`); });
-  page.on('dialog', (d) => d.accept());
+  // confirm は既定で「OK」。dismissNext を true にすると次の1回だけ「キャンセル」
+  const dialogs = [];
+  let dismissNext = false;
+  page.on('dialog', (d) => { dialogs.push(d.message()); if (dismissNext) { dismissNext = false; d.dismiss(); } else d.accept(); });
   const closeDialog = () => page.click('#dlg .dlg-head >> text=✕');
 
   /*
@@ -43,8 +46,15 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
 
   // プロフィール登録 → お試しモード
   await page.goto(URL_INDEX);
+  // メールアドレスは聞かない。端末名は自動で入る(ブラウザと OS の種類)
+  assert.strictEqual(await page.locator('.gate-card input[type=email]').count(), 0, 'メールアドレスの入力欄がないこと');
+  await page.waitForFunction(() => document.querySelectorAll('.gate-card input[type=text]')[1].value !== '');
+  assert.ok(/Windows|Linux|macOS|その他OS/.test(await page.inputValue('.gate-card input[type=text] >> nth=1')), '端末名が自動で入ること');
+  // 名前が空なら先へ進めない(ブラウザの入力チェックで止まる)
+  await page.click('text=次へ');
+  assert.strictEqual(await page.locator('.gate-card input[type=text] >> nth=0').evaluate((el) => el.validity.valueMissing), true);
+  assert.strictEqual(await page.locator('text=お試しモード').count(), 0, '名前が空のまま次へ進まないこと');
   await page.fill('.gate-card input[type=text] >> nth=0', '山田 太郎');
-  await page.fill('.gate-card input[type=email]', 'Taro@Example.com');
   await page.fill('.gate-card input[type=text] >> nth=1', 'PC-001');
   await page.click('text=次へ');
   await page.click('text=お試しモード');
@@ -57,7 +67,7 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   await page.waitForSelector('.ticket-main');
   await page.fill('.ticket-main textarea >> nth=0', '説明です https://example.com');
   await page.selectOption('.ticket-side select >> nth=0', '進行中');
-  await page.selectOption('.ticket-side select >> nth=1', 'taro@example.com');
+  await page.selectOption('.ticket-side select >> nth=1', { label: '山田 太郎' });
   await page.fill('.ticket-side input[type=date]', '2020-01-01');
   await page.fill('.ticket-side input[type=text]', 'UI, 緊急');
   await page.locator('.ticket-side input[type=text]').blur();
@@ -131,7 +141,8 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   assert.ok((await page.locator('tbody tr').count()) >= 12, '操作ログが記録されていること');
   assert.ok((await page.locator('tbody tr >> nth=0').innerText()).includes('PC-001'));
   await page.click('#nav >> text=メンバー');
-  assert.ok((await page.locator('tbody tr').innerText()).includes('taro@example.com'));
+  const memberRow = await page.locator('tbody tr').innerText();
+  assert.ok(/山田 太郎[\s\S]*u-[a-z0-9]{8}/.test(memberRow), `メンバーに名前と自動の利用者IDが出ること: ${memberRow}`);
 
   // 設定変更(ステータスを減らす)
   await page.click('#nav >> text=設定');
@@ -156,22 +167,29 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   assert.strictEqual(await page.inputValue('#dlg textarea[placeholder^=コメント]'), '書きかけのコメント', '下書きが残ること');
   await page.fill('#dlg textarea[placeholder^=コメント]', '');
 
-  // 関連: TK-2 を子にする。自分自身は登録できない
+  // 関連: 既存の TK-2 をサブチケットにする(関連欄ではなくサブチケット欄に出る)。自分自身は登録できない
   const relRow = '#dlg .ticket-main .row:has(select)';
   await page.selectOption(`${relRow} select`, 'child');
   await page.fill(`${relRow} input`, 'TK-2');
   await page.click(`${relRow} >> text=追加`);
-  await page.waitForSelector('#dlg .rel-list li:has-text("子チケット")');
+  await page.waitForSelector('#dlg .sub-list li:has-text("2つ目")');
   await page.selectOption(`${relRow} select`, 'parent');
   await page.fill(`${relRow} input`, 'TK-1');
   await page.click(`${relRow} >> text=追加`);
   await page.waitForSelector('#toast:has-text("自分自身")');
-  assert.strictEqual(await page.locator('#dlg .rel-list li').count(), 1);
+  assert.strictEqual(await page.locator('#dlg .rel-list li').count(), 0);
   await closeDialog();
   const card1 = await page.locator('.card:has-text("ログイン画面") .meta').innerText();
   assert.ok(card1.includes('☑ 1/2'), `チェックリストの進み具合: ${card1}`);
-  assert.ok(card1.includes('子 1/1'), `子チケットの進み具合: ${card1}`);
-  await page.click('.card:has-text("2つ目")');
+  assert.ok(card1.includes('サブ 1/1'), `サブチケットの進み具合: ${card1}`);
+  assert.strictEqual(await page.locator('.card:has-text("2つ目")').count(), 0, 'サブチケットはボードに出さない');
+  // サブは親の詳細から開く。親へのリンクと関連欄の「親チケット」が出る
+  const openSub = async (title) => {
+    await page.click(`.card:has-text("ログイン画面")`);
+    await page.click(`#dlg .sub-list li:has-text("${title}") .keylink`);
+    await page.waitForSelector('#dlg .dlg-head .parent-link');
+  };
+  await openSub('2つ目');
   await page.waitForSelector('#dlg .rel-list li:has-text("親チケット")');
   await closeDialog();
 
@@ -192,8 +210,8 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   assert.ok(await page.locator('#btnUnread').isHidden());
   await page.uncheck('text=新着のみ');
 
-  // アーカイブ
-  await page.click('.card:has-text("2つ目")');
+  // アーカイブ(親がアーカイブされていないサブは、「アーカイブを表示」で一覧に出る)
+  await openSub('2つ目');
   await page.click('#dlg .dlg-head >> text=アーカイブ');
   await page.waitForTimeout(400);
   assert.strictEqual(await page.locator('.card').count(), 1);
@@ -258,6 +276,120 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   }
   assert.ok(restored.some((r) => JSON.stringify(r.files) === JSON.stringify(['a (2).txt', 'a.txt'])), `添付が戻ること: ${JSON.stringify(restored)}`);
   assert.ok(restored.every((r) => r.checklist === 2), 'チェックリストも戻ること');
+
+  // プロジェクト: 設定で登録 → 作成時に選ぶ → カードに表示・フィルタで絞り込める
+  await page.click('#nav >> text=設定');
+  await page.fill('.panel textarea[placeholder^="例"]', 'Web\nアプリ\nWeb');
+  await page.click('.panel >> text=保存 >> nth=0');
+  await page.waitForSelector('#toast:has-text("設定を保存しました")');
+  await page.click('#nav >> text=ボード');
+  const projectFilter = '#filters select:has(option[value="Web"])';
+  assert.deepStrictEqual(await page.locator(`${projectFilter} option`).allTextContents(), ['プロジェクト: すべて', 'プロジェクトなし', 'Web', 'アプリ'], '重複は1つにまとめること');
+  await page.click('#btnCreate');
+  await page.fill('#dlg input[type=text]', 'Web の作業');
+  await page.selectOption('#dlg select:has(option[value="Web"])', 'Web');
+  await page.click('#dlg button[type=submit]');
+  await page.waitForSelector('.ticket-main');
+  assert.strictEqual(await page.inputValue('.ticket-side select:has(option[value="Web"])'), 'Web');
+
+  // サブチケット: 親の詳細から作る → ボード・リストに出ず、親に数が出る
+  for (const title of ['サブ作業1', 'サブ作業2']) {
+    await page.fill('#dlg .sub-add input', title);
+    await page.press('#dlg .sub-add input', 'Enter');
+    await page.waitForSelector(`#dlg .sub-list li:has-text("${title}")`);
+  }
+  await closeDialog();
+  assert.strictEqual(await page.locator('.card:has-text("サブ作業")').count(), 0, 'サブチケットはボードに出さない');
+  assert.strictEqual(await page.locator('.card').count(), 4);
+  assert.strictEqual(await page.textContent('#count'), '4 件', '件数にサブを含めない');
+  const webCard = '.card:has-text("Web の作業")';
+  assert.strictEqual(await page.textContent(`${webCard} .chip.project`), 'Web');
+  assert.ok((await page.innerText(`${webCard} .meta`)).includes('サブ 0/2'));
+
+  // サブはプロジェクトを引き継ぐ。サブを完了にすると親の数が進む
+  await page.click(webCard);
+  await page.click('#dlg .sub-list li:has-text("サブ作業1") .keylink');
+  await page.waitForSelector('#dlg .dlg-head .parent-link:has-text("Web の作業")');
+  assert.strictEqual(await page.inputValue('.ticket-side select:has(option[value="Web"])'), 'Web', 'プロジェクトを引き継ぐこと');
+  await page.selectOption('.ticket-side select >> nth=0', '完了');
+  await page.click('#dlg .dlg-head .parent-link .keylink');
+  await page.waitForSelector('#dlg .section-title:has-text("サブチケット (1/2)")');
+  await closeDialog();
+  assert.ok((await page.innerText(`${webCard} .meta`)).includes('サブ 1/2'));
+
+  // プロジェクトで絞り込み(ボード・リスト)
+  await page.selectOption(projectFilter, 'Web');
+  assert.strictEqual(await page.locator('.card').count(), 1);
+  await page.click('#nav >> text=リスト');
+  assert.strictEqual(await page.locator('tbody tr').count(), 1, 'リストにもサブを出さない');
+  assert.ok((await page.innerText('thead')).includes('プロジェクト'));
+  await page.click('#nav >> text=ボード');
+  await page.selectOption(projectFilter, '__none');
+  assert.strictEqual(await page.locator('.card').count(), 3);
+  await page.selectOption(projectFilter, '');
+  assert.strictEqual(await page.locator('.card').count(), 4);
+
+  // エラーチェック: 関連の追加で、形式違い・存在しないキー・アーカイブ済みのキーはエラー
+  await page.click(webCard);
+  const relRow2 = '#dlg .ticket-main .row:has(select)';
+  for (const [input, msg] of [['abc', 'チケットのキーではありません'], ['TK-999', 'TK-999 というチケットは見つかりません'], ['TK-2', 'アーカイブ済み'], ['', 'キーを入力してください']]) {
+    await page.fill(`${relRow2} input`, input);
+    await page.click(`${relRow2} >> text=追加`);
+    await page.waitForSelector(`#toast:has-text("${msg}")`);
+  }
+  assert.strictEqual(await page.locator('#dlg .rel-list li').count(), 0);
+  // 説明に存在しないキーを書くと知らせる
+  await page.fill('.ticket-main textarea >> nth=0', 'TK-1 と TK-998 を参照');
+  await page.locator('.ticket-main textarea >> nth=0').blur();
+  await page.waitForSelector('#dlg .refs .warn:has-text("TK-998")');
+  assert.ok(!(await page.innerText('#dlg .refs .warn')).includes('TK-1,'), '存在するキーは警告しない');
+  // 空のサブチケットはエラー
+  await page.press('#dlg .sub-add input', 'Enter');
+  await page.waitForSelector('#toast:has-text("タイトルを入力してください")');
+
+  // 他の人がファイルを消したチケットは、古いデータで書き戻さずエラーにする
+  const deleted = await page.evaluate(async () => {
+    const db = await new Promise((res, rej) => { const r = indexedDB.open('ticket-board', 2); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+    const req = (r) => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+    const store = (mode) => db.transaction('demo', mode).objectStore('demo');
+    for (const k of await req(store('readonly').getAllKeys(IDBKeyRange.bound('/tickets/', '/tickets/\uffff')))) {
+      const rec = await req(store('readonly').get(k));
+      if (!rec || rec.dir) continue;
+      if (JSON.parse(new TextDecoder().decode(rec.data)).title === 'Web の作業') { await req(store('readwrite').delete(k)); return k; }
+    }
+    return null;
+  });
+  assert.ok(deleted, 'テスト用にチケットのファイルを消せたこと');
+  const errCount = errors.length;
+  await page.fill('#dlg textarea[placeholder^=コメント]', '消えたチケットへのコメント');
+  await page.click('text=コメントする');
+  await page.waitForSelector('#toast:has-text("見つかりません")');
+  errors.splice(errCount); // 想定どおりのエラー(console.error)は除く
+  await page.click('#btnSync');
+  await page.waitForTimeout(300);
+  assert.ok(await page.locator('#dlg[open]').count() === 0, '消えたチケットのダイアログは閉じること');
+  assert.strictEqual(await page.locator('.card:has-text("Web の作業")').count(), 0, '書き戻して復活させないこと');
+  // 親が消えたサブは一覧に出て、詳細に ⚠ が出る
+  await page.click('.card:has-text("サブ作業1")');
+  await page.waitForSelector('#dlg .dlg-head .warn:has-text("親チケットが見つかりません")');
+  // 子から親を外すときは確認を出す。キャンセルなら外さない
+  const parentDel = '#dlg .rel-list li:has-text("親チケット") button:text-is("削除")';
+  dismissNext = true;
+  await page.click(parentDel);
+  assert.ok(dialogs.at(-1).includes('親チケット') && dialogs.at(-1).includes('サブチケットではなくなり'), `確認の文言: ${dialogs.at(-1)}`);
+  await page.waitForTimeout(300);
+  assert.strictEqual(await page.locator('#dlg .rel-list li:has-text("親チケット")').count(), 1, 'キャンセルしたら外さないこと');
+  await page.click(parentDel);
+  await page.waitForFunction(() => !document.querySelector('#dlg .dlg-head .warn'));
+  assert.strictEqual(await page.locator('#dlg .rel-list li:has-text("親チケット")').count(), 0, 'OK なら外すこと');
+  await closeDialog();
+
+  // 利用者ID: 設定に自分の ID が出る。存在しない ID は引き継げない
+  await page.click('#nav >> text=設定');
+  assert.ok(/^u-[a-z0-9]{8}$/.test(await page.textContent('[data-testid=my-id]')));
+  await page.fill('.panel:has(h2:text-is("利用者ID")) input', 'u-nobody00');
+  await page.click('.panel:has(h2:text-is("利用者ID")) button:text-is("引き継ぐ")');
+  await page.waitForSelector('#toast:has-text("u-nobody00」のメンバーは見つかりません")');
 
   assert.deepStrictEqual(errors, [], 'ブラウザのエラーがないこと');
   await browser.close();
