@@ -52,7 +52,7 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
 
   // リンクとコメント
   await page.fill('#dlg input[type=url]', 'https://app.box.com/s/abc');
-  await page.click('#dlg .row >> text=追加');
+  await page.click('#dlg .row:has(input[type=url]) >> text=追加');
   await page.waitForSelector('.link-list a');
   await page.fill('#dlg textarea[placeholder^=コメント]', 'コメント1 https://x.test');
   await page.click('text=コメントする');
@@ -119,6 +119,36 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   await page.waitForTimeout(300);
   await page.click('#nav >> text=ボード');
   assert.strictEqual(await page.locator('.column').count(), 3);
+
+  // チェックリスト: 2項目追加して1つ完了 → カードに ☑ 1/2
+  await page.click('.card:has-text("ログイン画面")');
+  await page.waitForSelector('.ticket-main');
+  for (const text of ['原因を調べる', '直す']) {
+    await page.fill('#dlg .checklist-add input', text);
+    await page.press('#dlg .checklist-add input', 'Enter');
+    await page.waitForSelector(`#dlg .checklist li:has-text("${text}")`);
+  }
+  await page.check('#dlg .checklist li >> nth=0 >> input[type=checkbox]');
+  await page.waitForSelector('#dlg .checklist li.done');
+
+  // 関連: TK-2 を子にする。自分自身は登録できない
+  const relRow = '#dlg .ticket-main .row:has(select)';
+  await page.selectOption(`${relRow} select`, 'child');
+  await page.fill(`${relRow} input`, 'TK-2');
+  await page.click(`${relRow} >> text=追加`);
+  await page.waitForSelector('#dlg .rel-list li:has-text("子チケット")');
+  await page.selectOption(`${relRow} select`, 'parent');
+  await page.fill(`${relRow} input`, 'TK-1');
+  await page.click(`${relRow} >> text=追加`);
+  await page.waitForSelector('#toast:has-text("自分自身")');
+  assert.strictEqual(await page.locator('#dlg .rel-list li').count(), 1);
+  await closeDialog();
+  const card1 = await page.locator('.card:has-text("ログイン画面") .meta').innerText();
+  assert.ok(card1.includes('☑ 1/2'), `チェックリストの進み具合: ${card1}`);
+  assert.ok(card1.includes('子 1/1'), `子チケットの進み具合: ${card1}`);
+  await page.click('.card:has-text("2つ目")');
+  await page.waitForSelector('#dlg .rel-list li:has-text("親チケット")');
+  await closeDialog();
 
   // アーカイブ
   await page.click('.card:has-text("2つ目")');

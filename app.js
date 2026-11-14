@@ -506,10 +506,11 @@ async function createTicket({ title, type, priority, assignee }) {
       id, key, num, title, description: '',
       type, status: state.config.statuses[0], priority, assignee,
       reporter: me.email, due: '', labels: [], links: [], comments: [], history: [],
+      checklist: [], relations: [], parent: '',
       archived: false, createdAt: now, updatedAt: now, updatedBy: me.email,
     };
     await writeJson(state.dirs.tickets, id + '.json', ticket);
-    state.tickets.set(id, ticket);
+    state.tickets.set(id, normalizeTicket(ticket, id));
     return ticket;
   });
   log('ticket.create', t.key, t.title);
@@ -552,6 +553,113 @@ async function setField(id, field, value) {
   log('ticket.update', t.key, field === 'description' ? `${label}を編集` : `${label}: ${entry.from} → ${entry.to}`);
   renderMain();
   refreshHistory();
+}
+
+/* ================= 関連チケット ================= */
+
+/*
+ * 関連は片方のチケットのファイルにだけ書く(2ファイル同時書き込みは同期ドライブで食い違うため)。
+ *   子チケット: parent = 親の id
+ *   元チケット: relations = [{ type: 'blocks' | 'relates', id }]
+ * 逆向き(子・ブロックされている・相手から張られた関連)は表示時に全チケットから求める。
+ */
+const REL_KINDS = [
+  ['parent', '親チケット'], ['child', '子チケット'],
+  ['blocks', 'ブロックしている'], ['blockedBy', 'ブロックされている'], ['relates', '関連'],
+];
+const relKindLabel = (k) => (REL_KINDS.find(([v]) => v === k) || [k, k])[1];
+
+/** a が b の祖先(親・親の親…)かどうか。壊れたデータで循環していても止まる */
+function isAncestor(aId, bId) {
+  const seen = new Set();
+  let cur = state.tickets.get(bId);
+  while (cur && cur.parent && !seen.has(cur.id)) {
+    seen.add(cur.id);
+    if (cur.parent === aId) return true;
+    cur = state.tickets.get(cur.parent);
+  }
+  return false;
+}
+
+/**
+ * チケットの関連を一覧にする。owner は実際にデータを持っているチケット(削除時に書き換える側)。
+ * other が null のときは相手のチケットが見つからない。
+ */
+function relationsOf(t) {
+  const out = [];
+  if (t.parent) out.push({ kind: 'parent', id: t.parent, owner: t.id, rel: null });
+  for (const r of t.relations) out.push({ kind: r.type, id: r.id, owner: t.id, rel: r });
+  for (const o of state.tickets.values()) {
+    if (o.id === t.id) continue;
+    if (o.parent === t.id) out.push({ kind: 'child', id: o.id, owner: o.id, rel: null });
+    for (const r of o.relations) {
+      if (r.id !== t.id) continue;
+      out.push({ kind: r.type === 'blocks' ? 'blockedBy' : 'relates', id: o.id, owner: o.id, rel: r });
+    }
+  }
+  const order = REL_KINDS.map(([k]) => k);
+  for (const x of out) x.other = state.tickets.get(x.id) || null;
+  return out.sort((a, b) => order.indexOf(a.kind) - order.indexOf(b.kind)
+    || String(a.other ? a.other.num : '').localeCompare(String(b.other ? b.other.num : ''), 'ja', { numeric: true }));
+}
+
+/** カード表示用の集計(子の完了数、未完了のチケットにブロックされているか)。renderMain ごとに作り直す */
+let relIndexCache = null;
+function relIndex() {
+  if (relIndexCache) return relIndexCache;
+  const children = new Map();
+  const blocked = new Set();
+  for (const o of state.tickets.values()) {
+    if (o.parent && !o.archived) {
+      const c = children.get(o.parent) || { done: 0, total: 0 };
+      c.total++;
+      if (isDone(o)) c.done++;
+      children.set(o.parent, c);
+    }
+    if (!o.archived && !isDone(o)) {
+      for (const r of o.relations) if (r.type === 'blocks') blocked.add(r.id);
+    }
+  }
+  relIndexCache = { children, blocked };
+  return relIndexCache;
+}
+
+/** 関連を追加する。書き込むのは1ファイルだけ */
+async function addRelation(t, kind, o) {
+  // 入力の誤りは例外にせず、知らせて終える(例外は想定外の失敗だけに使う)
+  const reject = (msg) => { toast(msg, true); return false; };
+  if (o.id === t.id) return reject('自分自身は指定できません');
+  if (relationsOf(t).some((x) => x.kind === kind && x.id === o.id)) return reject('すでに登録されています');
+  if (kind === 'parent' && isAncestor(t.id, o.id)) return reject('親子の関係が循環するため登録できません');
+  if (kind === 'child' && isAncestor(o.id, t.id)) return reject('親子の関係が循環するため登録できません');
+  const at = nowIso();
+  const by = state.me.email;
+  const note = (x, label, other) => x.history.push({ at, by, field: '関連', from: '', to: `追加: ${label} ${other.key}` });
+  if (kind === 'parent') {
+    await updateTicket(t.id, (x) => { x.parent = o.id; note(x, '親', o); });
+  } else if (kind === 'child') {
+    if (o.parent && o.parent !== t.id && !confirm(`${o.key} にはすでに親チケットがあります。親を ${t.key} に付け替えますか?`)) return false;
+    await updateTicket(o.id, (x) => { x.parent = t.id; note(x, '親', t); });
+  } else if (kind === 'blockedBy') {
+    await updateTicket(o.id, (x) => { x.relations.push({ type: 'blocks', id: t.id }); note(x, 'ブロック', t); });
+  } else {
+    await updateTicket(t.id, (x) => { x.relations.push({ type: kind, id: o.id }); note(x, relKindLabel(kind), o); });
+  }
+  log('relation.add', t.key, `${relKindLabel(kind)}: ${o.key}`);
+  return true;
+}
+
+/** 関連を削除する。データを持っている側(owner)のファイルだけを書き換える */
+async function removeRelation(t, x) {
+  const otherKey = x.other ? x.other.key : x.id;
+  await updateTicket(x.owner, (y) => {
+    // 読み直した時点で別の親に付け替えられていたら、そちらは消さない
+    if (x.kind === 'parent') { if (y.parent === x.id) y.parent = ''; }
+    else if (x.kind === 'child') { if (y.parent === t.id) y.parent = ''; }
+    else y.relations = y.relations.filter((r) => !(r.type === x.rel.type && r.id === x.rel.id));
+    y.history.push({ at: nowIso(), by: state.me.email, field: '関連', from: '', to: `削除: ${relKindLabel(x.kind)} ${otherKey}` });
+  });
+  log('relation.remove', t.key, `${relKindLabel(x.kind)}: ${otherKey}`);
 }
 
 /* ================= 添付ファイル ================= */
@@ -674,8 +782,21 @@ function restoreUi() {
   }
 }
 
+/** カード・一覧に出す小さなバッジ(チェックリスト・子チケットの進み具合、ブロック中) */
+function progressBadges(t) {
+  const idx = relIndex();
+  const kids = idx.children.get(t.id);
+  const done = t.checklist.filter((c) => c.done).length;
+  return [
+    idx.blocked.has(t.id) ? h('span', { class: 'badge blocked', title: '未完了のチケットにブロックされています' }, '⛔') : null,
+    t.checklist.length ? h('span', { class: 'badge' + (done === t.checklist.length ? ' ok' : ''), title: 'チェックリスト' }, `☑ ${done}/${t.checklist.length}`) : null,
+    kids ? h('span', { class: 'badge' + (kids.done === kids.total ? ' ok' : ''), title: '子チケット(完了/全体)' }, `子 ${kids.done}/${kids.total}`) : null,
+  ];
+}
+
 function renderMain() {
   saveUi();
+  relIndexCache = null;
   const main = $('main');
   const top = main.scrollTop;
   const views = { board: viewBoard, list: viewList, activity: viewActivity, members: viewMembers, settings: viewSettings };
@@ -718,6 +839,7 @@ function card(t) {
       h('span', { class: 'key' }, t.key),
       t.type ? h('span', { class: 'chip type' }, t.type) : null,
       prioChip(t.priority),
+      progressBadges(t),
       h('span', { class: 'spacer' }),
       t.comments.length ? h('span', { title: 'コメント数' }, `💬${t.comments.length}`) : null,
       t.due ? h('span', { class: 'due' + (isOverdue(t) ? ' over' : ''), title: '期限' }, t.due.slice(5).replace('-', '/')) : null,
@@ -756,7 +878,7 @@ function viewList() {
     h('thead', null, h('tr', null, cols.map(th))),
     h('tbody', null, tickets.map((t) => h('tr', { class: 'clickable', onclick: () => openTicket(t.id) },
       h('td', { class: 'nowrap' }, h('span', { class: 'key' }, t.key)),
-      h('td', { class: 'wrap' }, t.title),
+      h('td', { class: 'wrap' }, t.title, ' ', progressBadges(t)),
       h('td', { class: 'nowrap' }, t.type),
       h('td', { class: 'nowrap' }, t.status),
       h('td', { class: 'nowrap' }, prioChip(t.priority)),
@@ -1013,6 +1135,56 @@ function renderTicketDialog() {
   });
   commentBox.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) addComment(); });
 
+  /* --- チェックリスト --- */
+  const clInput = h('input', { type: 'text', placeholder: '項目を追加(Enter で追加)', maxLength: 200 });
+  const checkNote = (x, to) => x.history.push({ at: nowIso(), by: state.me.email, field: 'チェックリスト', from: '', to });
+  const addCheck = guard(async () => {
+    const text = clInput.value.trim();
+    if (!text) return;
+    const item = { id: uid(6), text, done: false, by: state.me.email, at: nowIso() };
+    await updateTicket(t.id, (x) => { x.checklist.push(item); checkNote(x, `追加: ${text}`); });
+    log('checklist.update', t.key, `追加: ${text}`);
+    rerender();
+    const next = dlg.querySelector('.checklist-add input');
+    if (next) next.focus();
+  });
+  clInput.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); addCheck(); } });
+  // id で対象を探して当てるので、読み直した最新のデータに対して他のメンバーの操作を消さない
+  const toggleCheck = (item) => guard(async (e) => {
+    const done = e.target.checked;
+    await updateTicket(t.id, (x) => {
+      const it = x.checklist.find((c) => c.id === item.id);
+      if (it) { it.done = done; checkNote(x, `${done ? '完了' : '未完了に戻す'}: ${it.text}`); }
+    });
+    log('checklist.update', t.key, `${done ? '完了' : '未完了に戻す'}: ${item.text}`);
+    rerender();
+  });
+  const removeCheck = (item) => guard(async () => {
+    await updateTicket(t.id, (x) => { x.checklist = x.checklist.filter((c) => c.id !== item.id); checkNote(x, `削除: ${item.text}`); });
+    log('checklist.update', t.key, `削除: ${item.text}`);
+    rerender();
+  });
+  const checkDone = t.checklist.filter((x) => x.done).length;
+
+  /* --- 関連チケット --- */
+  const rels = relationsOf(t);
+  const relKind = select(REL_KINDS, 'relates');
+  const listId = `rel-candidates-${t.id}`;
+  const relInput = h('input', { type: 'text', placeholder: `キー(例: ${c.key}-12)`, maxLength: 40 });
+  relInput.setAttribute('list', listId); // input.list は読み取り専用プロパティなので h() では渡せない
+  const candidates = h('datalist', { id: listId }, [...state.tickets.values()]
+    .filter((o) => o.id !== t.id && !o.archived)
+    .sort((a, b) => (Number(b.num) || 0) - (Number(a.num) || 0))
+    .map((o) => h('option', { value: o.key }, o.title)));
+  const addRel = guard(async () => {
+    const key = relInput.value.trim().split(/\s+/)[0].toUpperCase();
+    if (!key) return;
+    const o = findByKey(key);
+    if (!o) { toast(`${key} というチケットは見つかりません`, true); return; }
+    if (await addRelation(t, relKind.value, o)) rerender();
+  });
+  relInput.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); addRel(); } });
+
   historyBox = h('ul', { class: 'history' });
   const users = [...state.users.values()];
 
@@ -1047,6 +1219,24 @@ function renderTicketDialog() {
           const refs = referencedTickets(t.description, t.id);
           return refs.length ? h('div', { class: 'refs' }, h('span', { class: 'note' }, '参照:'), refs.map((r) => keyLink(r, `${r.key} ${r.title}`))) : null;
         })(),
+
+        h('div', { class: 'section-title' }, `チェックリスト${t.checklist.length ? ` (${checkDone}/${t.checklist.length})` : ''}`),
+        h('ul', { class: 'checklist' }, t.checklist.map((item) => h('li', { class: item.done ? 'done' : '' },
+          h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: !!item.done, onchange: toggleCheck(item) }), h('span', null, String(item.text ?? ''))),
+          h('button', { class: 'btn small danger', title: '削除', onclick: removeCheck(item) }, '削除')))),
+        h('div', { class: 'row checklist-add' }, clInput, h('button', { class: 'btn', onclick: addCheck }, '追加')),
+
+        h('div', { class: 'section-title' }, '関連チケット'),
+        h('ul', { class: 'link-list rel-list' }, rels.map((x) => h('li', null,
+          h('span', { class: 'chip' }, relKindLabel(x.kind)),
+          x.other
+            ? h('span', { class: 'name' }, keyLink(x.other), ' ', x.other.title, isDone(x.other) ? h('span', { class: 'note' }, ` (${x.other.status})`) : null)
+            : h('span', { class: 'name note' }, '(見つかりません)'),
+          h('button', {
+            class: 'btn small danger',
+            onclick: guard(async () => { await removeRelation(t, x); rerender(); }),
+          }, '削除')))),
+        h('div', { class: 'row' }, relKind, relInput, candidates, h('button', { class: 'btn', onclick: addRel }, '追加')),
 
         h('div', { class: 'section-title' }, '添付ファイル', h('span', { class: 'spacer' }),
           h('button', { class: 'btn small', onclick: () => picker.click() }, '＋ ファイルを追加'), picker),

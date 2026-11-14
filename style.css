@@ -243,3 +243,29 @@ td.wrap { overflow-wrap: anywhere; }
 .keylink:hover { filter: brightness(1.2); }
 .refs { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin-top: 4px; font-size: 12px; }
 .refs .keylink { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------- 進み具合のバッジ ---------- */
+.card .meta { flex-wrap: wrap; }
+.badge {
+  display: inline-block; padding: 0 5px; border-radius: 3px;
+  font-size: 11px; line-height: 18px; white-space: nowrap;
+  background: var(--surface-2); color: var(--muted);
+}
+.badge.ok { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+.badge.blocked { background: color-mix(in srgb, var(--danger) 15%, transparent); }
+td .badge { margin-left: 4px; vertical-align: 1px; }
+
+/* ---------- チェックリスト ---------- */
+.checklist { list-style: none; margin: 0 0 6px; padding: 0; }
+.checklist li { display: flex; align-items: center; gap: 8px; padding: 3px 4px; border-radius: var(--radius); }
+.checklist li:hover { background: var(--surface-2); }
+.checklist .check { flex: 1; min-width: 0; display: flex; align-items: flex-start; gap: 8px; margin: 0; font-size: 14px; color: var(--text); cursor: pointer; }
+.checklist .check input { margin-top: 4px; flex: none; }
+.checklist .check span { overflow-wrap: anywhere; }
+.checklist li.done .check span { text-decoration: line-through; color: var(--muted); }
+
+/* ---------- 関連チケット ---------- */
+.rel-list { margin-bottom: 6px; }
+.rel-list .chip { flex: none; }
+.rel-list .name { white-space: nowrap; }
+.row > select { flex: 0 0 auto; width: auto; }
