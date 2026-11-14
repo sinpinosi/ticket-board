@@ -60,7 +60,9 @@ const state = {
   fileMeta: new Map(),
   users: new Map(),
   view: 'board',
-  filters: { q: '', assignee: '', type: '', priority: '', mine: false, archived: false },
+  filters: { q: '', assignee: '', type: '', priority: '', mine: false, unread: false, archived: false },
+  seen: {},
+  seenKey: '',
   sort: { col: 'updatedAt', dir: -1 },
   openId: null,
   activity: { month: '', email: '' },
@@ -662,6 +664,57 @@ async function removeRelation(t, x) {
   log('relation.remove', t.key, `${relKindLabel(x.kind)}: ${otherKey}`);
 }
 
+/* ================= 新着(自分宛ての更新) ================= */
+
+/*
+ * 既読はこのブラウザの localStorage にだけ持つ({チケットid: 見たときの updatedAt})。
+ * 共有フォルダに書くファイルを増やさないため。保存先(フォルダ / お試し)ごとに分ける。
+ */
+function loadSeen(rootName) {
+  state.seenKey = `${SEEN_KEY}.${rootName}`;
+  const saved = lsGet(state.seenKey);
+  if (saved && typeof saved === 'object') {
+    // 消えたチケットの分は捨てる
+    state.seen = {};
+    for (const id of state.tickets.keys()) if (typeof saved[id] === 'string') state.seen[id] = saved[id];
+  } else {
+    // 初めて使うときは、今あるものを既読にしておく(いきなり大量の新着を出さない)
+    state.seen = {};
+    for (const t of state.tickets.values()) state.seen[t.id] = String(t.updatedAt || '');
+  }
+  lsSet(state.seenKey, state.seen);
+}
+
+/** 自分に関係するチケットか(担当・報告者・コメントした・チェック項目を足した) */
+function isMine(t) {
+  const me = state.me.email;
+  return t.assignee === me || t.reporter === me
+    || t.comments.some((c) => c && c.by === me) || t.checklist.some((c) => c.by === me);
+}
+
+function isUnread(t) {
+  return !t.archived && isMine(t) && t.updatedBy !== state.me.email
+    && String(t.updatedAt || '') > String(state.seen[t.id] || '');
+}
+
+/** 既読にする。変わったら true */
+function markSeen(t) {
+  const at = String(t.updatedAt || '');
+  if (state.seen[t.id] === at) return false;
+  state.seen[t.id] = at;
+  lsSet(state.seenKey, state.seen);
+  return true;
+}
+
+/** ヘッダーの 🔔 とタブのタイトルを更新する */
+function renderUnread() {
+  const n = [...state.tickets.values()].filter(isUnread).length;
+  const btn = $('btnUnread');
+  btn.hidden = n === 0;
+  btn.textContent = `🔔 ${n}`;
+  document.title = `${n ? `(${n}) ` : ''}${state.config.projectName} - Ticket Board`;
+}
+
 /* ================= 添付ファイル ================= */
 
 async function listAttachments(id) {
@@ -739,6 +792,8 @@ function renderFilters() {
     select([['', '種別: すべて'], ...state.config.types], f.type, on('type')),
     select([['', '優先度: すべて'], ...state.config.priorities], f.priority, on('priority')),
     h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: f.mine, onchange: on('mine', 'checked') }), '自分の担当のみ'),
+    h('label', { class: 'check', title: '自分に関係するチケットのうち、他の人が更新して未読のもの' },
+      h('input', { type: 'checkbox', checked: f.unread, onchange: on('unread', 'checked') }), '新着のみ'),
     h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: f.archived, onchange: on('archived', 'checked') }), 'アーカイブを表示'),
     h('span', { class: 'count', id: 'count' }),
   );
@@ -750,6 +805,7 @@ function visibleTickets() {
   return [...state.tickets.values()].filter((t) => {
     if (!!t.archived !== f.archived) return false;
     if (f.mine && t.assignee !== state.me.email) return false;
+    if (f.unread && !isUnread(t)) return false;
     if (f.assignee === '__none' ? !!t.assignee : f.assignee && t.assignee !== f.assignee) return false;
     if (f.type && t.type !== f.type) return false;
     if (f.priority && t.priority !== f.priority) return false;
@@ -765,7 +821,8 @@ const prioChip = (p) => (p ? h('span', { class: `chip p${prioIndex(p)}` }, p) : 
 
 /** 表示・絞り込み・並べ替えをこのブラウザに保存する(共有フォルダには書かない) */
 function saveUi() {
-  lsSet(UI_KEY, { view: state.view, filters: state.filters, sort: state.sort });
+  // 「新着のみ」は次に開いたときボードが空に見えて戸惑うので記憶しない
+  lsSet(UI_KEY, { view: state.view, filters: { ...state.filters, unread: false }, sort: state.sort });
 }
 /** 保存した表示を戻す。壊れた値や古い形式は無視し、知っている項目だけ型を確かめて取り込む */
 function restoreUi() {
@@ -802,6 +859,7 @@ function renderMain() {
   const views = { board: viewBoard, list: viewList, activity: viewActivity, members: viewMembers, settings: viewSettings };
   main.replaceChildren(views[state.view]());
   main.scrollTop = top;
+  renderUnread();
 }
 
 /* ================= 画面: ボード ================= */
@@ -832,8 +890,9 @@ function viewBoard() {
 }
 
 function card(t) {
-  const el = h('div', { class: 'card', draggable: true, onclick: () => openTicket(t.id) },
-    h('div', { class: 'title' }, t.title),
+  const unread = isUnread(t);
+  const el = h('div', { class: 'card' + (unread ? ' unread' : ''), draggable: true, onclick: () => openTicket(t.id) },
+    h('div', { class: 'title' }, unread ? h('span', { class: 'unread-dot', title: '新着の更新があります' }, '●') : null, t.title),
     t.labels.length ? h('div', { class: 'labels' }, t.labels.map((l) => h('span', { class: 'chip' }, l))) : null,
     h('div', { class: 'meta' },
       h('span', { class: 'key' }, t.key),
@@ -878,7 +937,7 @@ function viewList() {
     h('thead', null, h('tr', null, cols.map(th))),
     h('tbody', null, tickets.map((t) => h('tr', { class: 'clickable', onclick: () => openTicket(t.id) },
       h('td', { class: 'nowrap' }, h('span', { class: 'key' }, t.key)),
-      h('td', { class: 'wrap' }, t.title, ' ', progressBadges(t)),
+      h('td', { class: 'wrap' }, isUnread(t) ? h('span', { class: 'unread-dot', title: '新着の更新があります' }, '●') : null, t.title, ' ', progressBadges(t)),
       h('td', { class: 'nowrap' }, t.type),
       h('td', { class: 'nowrap' }, t.status),
       h('td', { class: 'nowrap' }, prioChip(t.priority)),
@@ -1069,6 +1128,8 @@ function refreshHistory() {
 function renderTicketDialog() {
   const t = state.tickets.get(state.openId);
   if (!t) { if (dlg.open) dlg.close(); return; }
+  // 開いて見えている = 既読。カードの ● を消すため一覧も描き直す
+  if (markSeen(t)) renderMain();
   const c = state.config;
   const oldMain = dlg.querySelector('.ticket-main');
   const scroll = [dlg.scrollTop, oldMain ? oldMain.scrollTop : 0];
@@ -1348,6 +1409,7 @@ async function start(root) {
   await registerUser();
   await loadUsers();
   await withLock(syncTicketsRaw);
+  loadSeen(lsGet('tb.mode') === 'demo' ? '(demo)' : root.name);
   log('access', '', `保存先: ${root.name}`);
 
   $('gate').hidden = true;
@@ -1400,6 +1462,12 @@ document.addEventListener('keydown', (e) => {
 $('btnCreate').title = 'チケット作成 (C)';
 $('btnCreate').addEventListener('click', openCreateDialog);
 $('btnSync').addEventListener('click', guard(() => refresh(true)));
+$('btnUnread').addEventListener('click', () => {
+  state.filters.unread = true;
+  if (state.view !== 'board' && state.view !== 'list') state.view = 'board';
+  renderChrome();
+  renderMain();
+});
 boot();
 
 })();

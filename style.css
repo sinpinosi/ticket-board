@@ -269,3 +269,8 @@ td .badge { margin-left: 4px; vertical-align: 1px; }
 .rel-list .chip { flex: none; }
 .rel-list .name { white-space: nowrap; }
 .row > select { flex: 0 0 auto; width: auto; }
+
+/* ---------- 新着 ---------- */
+.unread-dot { color: var(--accent); font-size: 10px; margin-right: 5px; vertical-align: 2px; }
+.card.unread { border-left: 3px solid var(--accent); }
+.unread-btn { color: var(--accent); border-color: var(--accent); font-weight: 600; }

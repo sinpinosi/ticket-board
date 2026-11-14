@@ -20,6 +20,27 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   page.on('dialog', (d) => d.accept());
   const closeDialog = () => page.click('#dlg .dlg-head >> text=✕');
 
+  /*
+   * お試しモードの保存先(IndexedDB の demo ストア)を直接操作して、他のメンバーの書き込みを再現する。
+   * op: 'patch' はキーが key のチケットに patch を当てる。'put' は tickets/<fileId>.json に ticket をそのまま書く。
+   */
+  const demoWrite = (arg) => page.evaluate(async ({ op, key, patch, fileId, ticket }) => {
+    const db = await new Promise((res, rej) => { const r = indexedDB.open('ticket-board', 2); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+    const req = (r) => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+    const store = (mode) => db.transaction('demo', mode).objectStore('demo');
+    const put = (path, obj) => req(store('readwrite').put({ data: new TextEncoder().encode(JSON.stringify(obj)).buffer, type: '', lastModified: Date.now() }, path));
+    if (op === 'put') return put(`/tickets/${fileId}.json`, ticket);
+    for (const k of await req(store('readonly').getAllKeys(IDBKeyRange.bound('/tickets/', '/tickets/￿')))) {
+      const rec = await req(store('readonly').get(k));
+      if (!rec || rec.dir) continue;
+      const t = JSON.parse(new TextDecoder().decode(rec.data));
+      if (t.key !== key) continue;
+      await put(k, { ...t, ...patch });
+      return t;
+    }
+    throw new Error(`チケット ${key} が見つかりません`);
+  }, { op: 'patch', ...arg });
+
   // プロフィール登録 → お試しモード
   await page.goto(URL_INDEX);
   await page.fill('.gate-card input[type=text] >> nth=0', '山田 太郎');
@@ -149,6 +170,23 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   await page.click('.card:has-text("2つ目")');
   await page.waitForSelector('#dlg .rel-list li:has-text("親チケット")');
   await closeDialog();
+
+  // 新着: 他の人が自分の担当チケットを更新すると ● と 🔔1 が出て、開くと消える
+  assert.strictEqual(await page.locator('.card.unread').count(), 0, '自分の更新は新着にしない');
+  await demoWrite({ key: 'TK-1', patch: { updatedBy: 'hanako@example.com', updatedAt: new Date(Date.now() + 60000).toISOString() } });
+  await page.click('#btnSync');
+  await page.waitForSelector('.card.unread');
+  assert.strictEqual(await page.locator('#btnUnread').textContent(), '🔔 1');
+  assert.ok((await page.title()).startsWith('(1) '), 'タブのタイトルに件数が出ること');
+  await page.click('#btnUnread');
+  assert.ok(await page.isChecked('text=新着のみ'));
+  assert.strictEqual(await page.locator('.card').count(), 1);
+  await page.click('.card.unread');
+  await page.waitForSelector('.ticket-main');
+  await closeDialog();
+  assert.strictEqual(await page.locator('.card.unread').count(), 0, '開いたら既読になること');
+  assert.ok(await page.locator('#btnUnread').isHidden());
+  await page.uncheck('text=新着のみ');
 
   // アーカイブ
   await page.click('.card:has-text("2つ目")');
