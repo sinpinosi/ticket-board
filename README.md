@@ -109,3 +109,15 @@ npm install
 npx playwright-core install chromium
 npm test
 ```
+
+## コントリビュート
+
+不具合の報告や改善の提案を歓迎します。手順は [CONTRIBUTING.md](CONTRIBUTING.md) を見てください。
+
+## ライセンス
+
+[MIT ライセンス](LICENSE)です。商用・社内利用を含め、無料で自由に利用・改変・再配布できます。再配布するときは、著作権表示とライセンス文を残してください。
+
+このソフトウェアは無保証です。チケットや添付ファイルのバックアップは、共有ドライブのバージョン履歴などで各自確保してください。
+
+アプリ本体は外部ライブラリを使っていません。テストだけが [Playwright](https://playwright.dev/)(Apache License 2.0)を使います。

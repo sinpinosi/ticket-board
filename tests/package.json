@@ -1,6 +1,7 @@
 {
   "name": "ticket-board-tests",
   "private": true,
+  "license": "MIT",
   "scripts": {
     "test": "node e2e.js"
   },
