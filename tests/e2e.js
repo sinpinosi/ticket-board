@@ -149,8 +149,12 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
     await page.press('#dlg .checklist-add input', 'Enter');
     await page.waitForSelector(`#dlg .checklist li:has-text("${text}")`);
   }
+  // コメントを書きかけのままチェックを付けても、書きかけの内容は消えない
+  await page.fill('#dlg textarea[placeholder^=コメント]', '書きかけのコメント');
   await page.check('#dlg .checklist li >> nth=0 >> input[type=checkbox]');
   await page.waitForSelector('#dlg .checklist li.done');
+  assert.strictEqual(await page.inputValue('#dlg textarea[placeholder^=コメント]'), '書きかけのコメント', '下書きが残ること');
+  await page.fill('#dlg textarea[placeholder^=コメント]', '');
 
   // 関連: TK-2 を子にする。自分自身は登録できない
   const relRow = '#dlg .ticket-main .row:has(select)';

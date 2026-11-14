@@ -425,12 +425,16 @@ function normalizeTicket(t, id) {
   t.key = String(t.key || id);
   t.title = String(t.title || '(無題)');
   t.description = String(t.description || '');
+  // 他メンバー(やバックアップ)が書いた値なので、文字列として使う項目は文字列にそろえる(t.due.slice 等で落ちないように)
+  for (const k of ['status', 'type', 'priority', 'assignee', 'reporter', 'due', 'createdAt', 'updatedAt', 'updatedBy']) {
+    t[k] = t[k] == null ? '' : String(t[k]);
+  }
   t.labels = Array.isArray(t.labels) ? t.labels.map(String) : [];
   t.links = Array.isArray(t.links) ? t.links : [];
   t.comments = Array.isArray(t.comments) ? t.comments : [];
   t.history = Array.isArray(t.history) ? t.history : [];
-  t.checklist = Array.isArray(t.checklist) ? t.checklist.filter((c) => c && typeof c === 'object' && c.id) : [];
-  t.relations = Array.isArray(t.relations) ? t.relations.filter((r) => r && typeof r === 'object' && r.id && REL_TYPES.includes(r.type)) : [];
+  t.checklist = Array.isArray(t.checklist) ? t.checklist.filter((c) => c && typeof c === 'object' && typeof c.id === 'string' && c.id) : [];
+  t.relations = Array.isArray(t.relations) ? t.relations.filter((r) => r && typeof r === 'object' && typeof r.id === 'string' && r.id && REL_TYPES.includes(r.type)) : [];
   t.parent = typeof t.parent === 'string' ? t.parent : '';
   return t;
 }
@@ -475,7 +479,8 @@ async function registerUser() {
 
 async function refresh(force) {
   let changed = await withLock(syncTicketsRaw);
-  if (await fixDuplicateKeys()) changed = true;
+  // 振り直しに失敗しても(読み取り専用のフォルダなど)、他の人の更新の反映は止めない
+  try { if (await fixDuplicateKeys()) changed = true; } catch (e) { console.warn('キーの振り直しに失敗', e); }
   const before = JSON.stringify([state.config, [...state.users]]);
   await loadConfig();
   await loadUsers();
@@ -498,9 +503,7 @@ async function createTicket({ title, type, priority, assignee }) {
   const me = state.me;
   const t = await withLock(async () => {
     await syncTicketsRaw();
-    let max = 0;
-    for (const x of state.tickets.values()) max = Math.max(max, Number(x.num) || 0);
-    const num = max + 1;
+    const num = maxNum() + 1;
     const key = `${state.config.key}-${num}`;
     // 同時作成で番号が重複してもファイルが上書きされないよう、ランダムな接尾辞を付ける
     const id = `${safeName(key)}-${uid(4)}`;
@@ -569,7 +572,14 @@ async function setField(id, field, value) {
 const byCreated = (a, b) => String(a.createdAt).localeCompare(String(b.createdAt)) || a.id.localeCompare(b.id);
 const isConflictCopy = (a, b) => a.createdAt === b.createdAt && a.title === b.title;
 const keyPrefix = (key) => String(key).replace(/-\d+$/, '');
-const maxNum = () => Math.max(0, ...[...state.tickets.values()].map((x) => Number(x.num) || 0));
+/** 番号として使える値だけを数える(Infinity や巨大値で TK-Infinity にならないように) */
+const numOf = (x) => { const n = Number(x && x.num); return Number.isSafeInteger(n) && n > 0 ? n : 0; };
+const maxNum = (extra = []) => {
+  let m = 0;
+  for (const x of state.tickets.values()) m = Math.max(m, numOf(x));
+  for (const x of extra) m = Math.max(m, numOf(x));
+  return m;
+};
 
 function duplicateGroups() {
   const byKey = new Map();
@@ -600,6 +610,9 @@ async function fixDuplicateKeys() {
       if (!fresh) return null;
       normalizeTicket(fresh, t.id);
       if (fresh.key !== oldKey) return null; // 別の端末で振り直し済み
+      // 読み直した時点でも重複していて、自分が先頭(キーを持ち続ける側)でないときだけ振り直す
+      const group = [...state.tickets.values()].filter((x) => x.key === oldKey).sort(byCreated);
+      if (group.length < 2 || group[0].id === t.id) return null;
       const num = maxNum() + 1;
       fresh.num = num;
       fresh.key = `${keyPrefix(oldKey)}-${num}`;
@@ -673,7 +686,7 @@ function relIndex() {
   const children = new Map();
   const blocked = new Set();
   for (const o of state.tickets.values()) {
-    if (o.parent && !o.archived) {
+    if (o.parent && o.parent !== o.id && !o.archived) {
       const c = children.get(o.parent) || { done: 0, total: 0 };
       c.total++;
       if (isDone(o)) c.done++;
@@ -702,6 +715,8 @@ async function addRelation(t, kind, o) {
   const by = state.me.email;
   const note = (x, label, other) => x.history.push({ at, by, field: '関連', from: '', to: `追加: ${label} ${other.key}` });
   if (kind === 'parent') {
+    const cur = t.parent && state.tickets.get(t.parent);
+    if (cur && !confirm(`${t.key} にはすでに親チケット ${cur.key} があります。親を ${o.key} に付け替えますか?`)) return false;
     await updateTicket(t.id, (x) => { x.parent = o.id; note(x, '親', o); });
   } else if (kind === 'child') {
     if (o.parent && o.parent !== t.id && !confirm(`${o.key} にはすでに親チケットがあります。親を ${t.key} に付け替えますか?`)) return false;
@@ -737,7 +752,8 @@ async function removeRelation(t, x) {
 function loadSeen(rootName) {
   state.seenKey = `${SEEN_KEY}.${rootName}`;
   const saved = lsGet(state.seenKey);
-  if (saved && typeof saved === 'object') {
+  // 空の記録は「初回」と同じに扱う(同期前の空フォルダで起動した後に、全部が新着になるのを防ぐ)
+  if (saved && typeof saved === 'object' && Object.keys(saved).length) {
     // 消えたチケットの分は捨てる
     state.seen = {};
     for (const id of state.tickets.keys()) if (typeof saved[id] === 'string') state.seen[id] = saved[id];
@@ -836,6 +852,12 @@ async function openAttachment(handle) {
 
 const BACKUP_FORMAT = 'ticket-board-backup';
 const SAFE_ID = /^[A-Za-z0-9._@-]+$/;
+const WIN_RESERVED = /^(con|prn|aux|nul|com\d|lpt\d)(\.|$)/i;
+/** 共有フォルダにファイル名として書いてよいか。anyChars が false なら id 用に英数字と ._@- だけ許す */
+function isSafeFileName(name, anyChars) {
+  return typeof name === 'string' && name.length > 0 && name.length <= 120
+    && (anyChars || SAFE_ID.test(name)) && !/^\.+$/.test(name) && !/[. ]$/.test(name) && !WIN_RESERVED.test(name);
+}
 
 const blobToBase64 = (blob) => new Promise((res, rej) => {
   const r = new FileReader();
@@ -904,9 +926,18 @@ async function importBackup(file) {
     toast('Ticket Board のバックアップファイルではありません', true);
     return;
   }
-  const valid = data.tickets.filter((t) => t && typeof t === 'object' && typeof t.id === 'string' && SAFE_ID.test(t.id) && !/^\.+$/.test(t.id));
+  // Windows / macOS のドライブは大文字小文字を区別しないので、id の比較は小文字でそろえる(既存の上書きを防ぐ)
+  const existingIds = () => new Set([...state.tickets.keys()].map((id) => id.toLowerCase()));
   await withLock(syncTicketsRaw);
-  const toAdd = valid.filter((t) => !state.tickets.has(t.id));
+  const have = existingIds();
+  const toAdd = [];
+  for (const t of data.tickets) {
+    if (!t || typeof t !== 'object' || !isSafeFileName(t.id)) continue;
+    const low = t.id.toLowerCase();
+    if (have.has(low)) continue;
+    have.add(low); // バックアップ内で大文字小文字だけ違う id も1件にする
+    toAdd.push(t);
+  }
   const skipped = data.tickets.length - toAdd.length;
   if (!toAdd.length) { toast(`読み込めるチケットがありません(${skipped} 件はすでにあるか、形式が正しくありません)`, true); return; }
   if (!confirm(`チケット ${toAdd.length} 件を今のデータに追加します。${skipped ? `(${skipped} 件はすでにあるか形式が正しくないため読み込みません)` : ''}\n今あるチケットは上書きしません。キーが重複するものは番号を振り直します。\n\nよろしいですか?`)) return;
@@ -916,40 +947,61 @@ async function importBackup(file) {
     // 振り直すのは読み込み先に既にあるキーとぶつかるものだけ。バックアップ内での重複(競合コピーなど)は
     // そのまま持ち込み、ふだんの重複対策(fixDuplicateKeys)に任せる
     const usedKeys = new Set([...state.tickets.values()].map((t) => t.key));
-    let max = Math.max(maxNum(), ...toAdd.map((t) => Number(t.num) || 0));
+    const now = existingIds();
+    let max = maxNum(toAdd);
     const out = [];
+    let failed = 0;
     for (const src of toAdd) {
-      if (state.tickets.has(src.id)) continue;
-      const t = normalizeTicket(structuredClone(src), src.id);
-      if (usedKeys.has(t.key)) {
-        const oldKey = t.key;
-        t.num = ++max;
-        t.key = `${state.config.key}-${t.num}`;
-        t.history.push({ at: nowIso(), by: state.me.email, field: 'キー', from: oldKey, to: `${t.key}(バックアップの読み込み時に振り直し)` });
+      if (now.has(src.id.toLowerCase())) continue; // 確認ダイアログの間に他の人が作った
+      try {
+        const t = normalizeTicket(structuredClone(src), src.id);
+        if (usedKeys.has(t.key)) {
+          const oldKey = t.key;
+          t.num = ++max;
+          t.key = `${state.config.key}-${t.num}`;
+          t.history.push({ at: nowIso(), by: state.me.email, field: 'キー', from: oldKey, to: `${t.key}(バックアップの読み込み時に振り直し)` });
+        }
+        await writeJson(state.dirs.tickets, t.id + '.json', t);
+        state.tickets.set(t.id, t);
+        out.push(t);
+      } catch (e) {
+        console.warn('チケットの読み込みに失敗', src.id, e);
+        failed++;
       }
-      await writeJson(state.dirs.tickets, t.id + '.json', t);
-      state.tickets.set(t.id, t);
-      out.push(t);
     }
-    return out;
+    return { out, failed };
   });
 
-  let files = 0;
+  // 添付は1件ずつ。壊れたデータがあっても残りは読み込む
+  let files = 0, fileFailed = 0;
   const atts = data.attachments && typeof data.attachments === 'object' ? data.attachments : {};
-  for (const t of added) {
+  for (const t of added.out) {
     const list = Array.isArray(atts[t.id]) ? atts[t.id] : [];
     if (!list.length) continue;
-    const dir = await state.dirs.attachments.getDirectoryHandle(t.id, { create: true });
+    let dir;
+    try { dir = await state.dirs.attachments.getDirectoryHandle(t.id, { create: true }); }
+    catch (e) { console.warn('添付フォルダを作れません', t.id, e); fileFailed += list.length; continue; }
     for (const f of list) {
-      const name = String(f && f.name || '').replace(/[\\/:*?"<>|]/g, '_');
-      if (!name || /^\.+$/.test(name) || typeof f.data !== 'string') continue;
-      await writeFile(dir, name, base64ToBlob(f.data, f.type));
-      files++;
+      try {
+        const name = String(f && f.name || '').replace(/[\\/:*?"<>|\x00-\x1f]/g, '_');
+        if (!isSafeFileName(name, true) || typeof f.data !== 'string') { fileFailed++; continue; }
+        await writeFile(dir, name, base64ToBlob(f.data, f.type));
+        files++;
+      } catch (e) {
+        console.warn('添付の読み込みに失敗', t.id, e);
+        fileFailed++;
+      }
     }
   }
-  log('data.import', '', `チケット ${added.length} 件、添付 ${files} 件`);
+  // 自分で読み込んだものなので既読にする(担当のものが全部新着に出ないように)
+  for (const t of added.out) state.seen[t.id] = String(t.updatedAt || '');
+  lsSet(state.seenKey, state.seen);
+  backupUi.at = 0; // 添付の集計をやり直す
+
+  log('data.import', '', `チケット ${added.out.length} 件、添付 ${files} 件` + (added.failed || fileFailed ? `(失敗: チケット ${added.failed} 件、添付 ${fileFailed} 件)` : ''));
   await refresh(true);
-  toast(`チケット ${added.length} 件と添付 ${files} 件を読み込みました`);
+  if (added.failed || fileFailed) toast(`チケット ${added.out.length} 件と添付 ${files} 件を読み込みました。読み込めなかったもの: チケット ${added.failed} 件、添付 ${fileFailed} 件`, true);
+  else toast(`チケット ${added.out.length} 件と添付 ${files} 件を読み込みました`);
 }
 
 /* ================= 画面: 共通部分 ================= */
@@ -1238,13 +1290,28 @@ function viewSettings() {
     backupPanel());
 }
 
+/*
+ * 設定画面は他の人の更新のたびに描き直されるので、添付の集計(全添付フォルダの走査)は
+ * 60秒間は前回の結果を使い、チェック状態も覚えておく
+ */
+const backupUi = { withAtt: true, stats: null, at: 0 };
+const BACKUP_WARN_BYTES = 200 * 1024 * 1024;
+
 function backupPanel() {
-  const withAtt = h('input', { type: 'checkbox', checked: true });
+  const withAtt = h('input', { type: 'checkbox', checked: backupUi.withAtt, onchange: (e) => { backupUi.withAtt = e.target.checked; } });
   const stats = h('span', { class: 'note' }, '(添付を数えています…)');
-  guard(async () => {
-    const s = await attachmentStats();
-    stats.textContent = `(添付 ${s.count} 件・合計 ${fmtSize(s.size)})`;
-  })();
+  const show = (s) => {
+    stats.textContent = `(添付 ${s.count} 件・合計 ${fmtSize(s.size)})`
+      + (s.size > BACKUP_WARN_BYTES ? ' 添付が大きいため、保存に失敗することがあります。その場合は添付を含めずに保存し、添付は attachments フォルダごとコピーしてください' : '');
+  };
+  if (backupUi.stats && Date.now() - backupUi.at < 60000) show(backupUi.stats);
+  else {
+    guard(async () => {
+      backupUi.stats = await attachmentStats();
+      backupUi.at = Date.now();
+      show(backupUi.stats);
+    })();
+  }
   const picker = h('input', {
     type: 'file', accept: '.json,application/json', hidden: true,
     onchange: guard(async (e) => {
@@ -1344,6 +1411,10 @@ function renderTicketDialog() {
   if (!t) { if (dlg.open) dlg.close(); return; }
   // 開いて見えている = 既読。カードの ● を消すため一覧も描き直す
   if (markSeen(t)) renderMain();
+  // 描き直すと入力欄が新しくなるので、同じチケットなら書きかけの内容(コメント・リンク・関連・チェック項目)を引き継ぐ
+  const drafts = dlg.dataset.ticket === t.id
+    ? Object.fromEntries([...dlg.querySelectorAll('[data-draft]')].map((el) => [el.dataset.draft, el.value]))
+    : {};
   const c = state.config;
   const oldMain = dlg.querySelector('.ticket-main');
   const scroll = [dlg.scrollTop, oldMain ? oldMain.scrollTop : 0];
@@ -1387,31 +1458,33 @@ function renderTicketDialog() {
   zone.addEventListener('drop', (e) => { e.preventDefault(); zone.classList.remove('drop'); upload([...e.dataTransfer.files]); });
 
   /* --- リンク --- */
-  const linkTitle = h('input', { type: 'text', placeholder: '表示名(省略可)', maxLength: 100 });
-  const linkUrl = h('input', { type: 'url', placeholder: 'https://app.box.com/s/...' });
+  const linkTitle = h('input', { type: 'text', placeholder: '表示名(省略可)', maxLength: 100, 'data-draft': 'linkTitle' });
+  const linkUrl = h('input', { type: 'url', placeholder: 'https://app.box.com/s/...', 'data-draft': 'linkUrl' });
   const addLink = guard(async () => {
     const url = linkUrl.value.trim();
     if (!/^https?:\/\/\S+$/i.test(url)) { toast('http(s):// で始まるURLを入力してください', true); return; }
     const link = { id: uid(6), title: linkTitle.value.trim() || url, url, by: state.me.email, at: nowIso() };
     await updateTicket(t.id, (x) => { x.links.push(link); x.history.push({ at: link.at, by: link.by, field: 'リンク', from: '', to: `追加: ${link.title}` }); });
     log('link.add', t.key, url);
+    linkTitle.value = linkUrl.value = '';
     rerender();
   });
   const links = t.links.filter((l) => l && /^https?:\/\//i.test(String(l.url)));
 
   /* --- コメント --- */
-  const commentBox = h('textarea', { rows: 3, placeholder: 'コメントを入力(Ctrl+Enter で送信)' });
+  const commentBox = h('textarea', { rows: 3, placeholder: 'コメントを入力(Ctrl+Enter で送信)', 'data-draft': 'comment' });
   const addComment = guard(async () => {
     const body = commentBox.value.trim();
     if (!body) return;
     await updateTicket(t.id, (x) => x.comments.push({ id: uid(6), by: state.me.email, at: nowIso(), body }));
     log('comment.add', t.key, body.slice(0, 80));
+    commentBox.value = '';
     rerender();
   });
   commentBox.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) addComment(); });
 
   /* --- チェックリスト --- */
-  const clInput = h('input', { type: 'text', placeholder: '項目を追加(Enter で追加)', maxLength: 200 });
+  const clInput = h('input', { type: 'text', placeholder: '項目を追加(Enter で追加)', maxLength: 200, 'data-draft': 'check' });
   const checkNote = (x, to) => x.history.push({ at: nowIso(), by: state.me.email, field: 'チェックリスト', from: '', to });
   const addCheck = guard(async () => {
     const text = clInput.value.trim();
@@ -1419,6 +1492,7 @@ function renderTicketDialog() {
     const item = { id: uid(6), text, done: false, by: state.me.email, at: nowIso() };
     await updateTicket(t.id, (x) => { x.checklist.push(item); checkNote(x, `追加: ${text}`); });
     log('checklist.update', t.key, `追加: ${text}`);
+    clInput.value = '';
     rerender();
     const next = dlg.querySelector('.checklist-add input');
     if (next) next.focus();
@@ -1445,7 +1519,7 @@ function renderTicketDialog() {
   const rels = relationsOf(t);
   const relKind = select(REL_KINDS, 'relates');
   const listId = `rel-candidates-${t.id}`;
-  const relInput = h('input', { type: 'text', placeholder: `キー(例: ${c.key}-12)`, maxLength: 40 });
+  const relInput = h('input', { type: 'text', placeholder: `キー(例: ${c.key}-12)`, maxLength: 40, 'data-draft': 'rel' });
   relInput.setAttribute('list', listId); // input.list は読み取り専用プロパティなので h() では渡せない
   const candidates = h('datalist', { id: listId }, [...state.tickets.values()]
     .filter((o) => o.id !== t.id && !o.archived)
@@ -1456,7 +1530,7 @@ function renderTicketDialog() {
     if (!key) return;
     const o = findByKey(key);
     if (!o) { toast(`${key} というチケットは見つかりません`, true); return; }
-    if (await addRelation(t, relKind.value, o)) rerender();
+    if (await addRelation(t, relKind.value, o)) { relInput.value = ''; rerender(); }
   });
   relInput.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); addRel(); } });
 
@@ -1559,6 +1633,8 @@ function renderTicketDialog() {
           h('div', null, `作成: ${fmtDateTime(t.createdAt)}`),
           h('div', null, `更新: ${fmtDateTime(t.updatedAt)} (${nameOf(t.updatedBy)})`)))));
 
+  dlg.dataset.ticket = t.id;
+  for (const el of dlg.querySelectorAll('[data-draft]')) if (drafts[el.dataset.draft]) el.value = drafts[el.dataset.draft];
   refreshHistory();
   loadFiles();
   dlg.scrollTop = scroll[0];
@@ -1566,7 +1642,7 @@ function renderTicketDialog() {
   if (newMain) newMain.scrollTop = scroll[1];
 }
 
-dlg.addEventListener('close', () => { state.openId = null; });
+dlg.addEventListener('close', () => { state.openId = null; dlg.dataset.ticket = ''; });
 dlg.addEventListener('mousedown', (e) => { if (e.target === dlg) dlg.close(); });
 
 /* ================= 起動 ================= */
