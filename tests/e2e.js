@@ -63,22 +63,44 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   assert.strictEqual(await page.locator('.card .title >> nth=0').textContent(), 'ログイン画面のバグ <b>x</b>');
   assert.strictEqual(await page.locator('.card b').count(), 0, 'タイトルが HTML として解釈されていないこと');
 
-  // 2件目を作り、ドラッグで「完了」へ移動
-  await page.click('#btnCreate');
+  // 2件目をショートカット(C)で作る
+  await page.keyboard.press('c');
+  await page.waitForSelector('#dlg.narrow[open]');
   await page.fill('#dlg input[type=text]', '2つ目');
   await page.click('#dlg button[type=submit]');
   await page.waitForSelector('.ticket-main');
+
+  // コメント中のキーがリンクになり、押すとそのチケットが開く
+  await page.fill('#dlg textarea[placeholder^=コメント]', 'TK-1 と同じ原因。TK-999 は存在しない');
+  await page.click('text=コメントする');
+  await page.waitForSelector('.comment .keylink');
+  assert.strictEqual(await page.locator('.comment .keylink').count(), 1, '存在しないキーはリンクにしない');
+  await page.click('.comment .keylink');
+  await page.waitForSelector('#dlg .dlg-head .key:text-is("TK-1")');
   await closeDialog();
+
+  // ドラッグで「完了」へ移動
   await page.dragAndDrop('.card:has-text("2つ目")', '.column >> nth=3');
   await page.waitForTimeout(400);
   const columns = await page.locator('.column').evaluateAll((cols) =>
     cols.map((c) => [...c.querySelectorAll('.card .key')].map((k) => k.textContent)));
   assert.deepStrictEqual(columns, [[], ['TK-1'], [], ['TK-2']]);
 
-  // 再読み込み後もデータが残ること
+  // 再読み込み後もデータと絞り込みが残ること
+  await page.check('text=自分の担当のみ');
   await page.reload();
   await page.waitForSelector('.card');
+  assert.ok(await page.isChecked('text=自分の担当のみ'), '絞り込みが記憶されていること');
+  assert.strictEqual(await page.locator('.card').count(), 1);
+  await page.uncheck('text=自分の担当のみ');
   assert.strictEqual(await page.locator('.card').count(), 2);
+
+  // "/" で検索欄にフォーカスが移る
+  await page.locator('body').click({ position: { x: 5, y: 5 } });
+  await page.keyboard.press('/');
+  assert.strictEqual(await page.evaluate(() => document.activeElement.type), 'search');
+  await page.keyboard.press('Escape');
+  await page.locator('body').click({ position: { x: 5, y: 5 } });
 
   // リスト・操作ログ・メンバー
   await page.click('#nav >> text=リスト');

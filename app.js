@@ -37,7 +37,17 @@ const ACTION_LABELS = {
   'link.remove': 'リンク削除',
   'config.update': '設定変更',
   'profile.update': 'プロフィール変更',
+  'checklist.update': 'チェックリスト変更',
+  'relation.add': '関連追加',
+  'relation.remove': '関連削除',
+  'ticket.renumber': 'キー振り直し',
+  'data.export': 'バックアップ保存',
+  'data.import': 'バックアップ読み込み',
 };
+/** 関連の種類(parent は別項目で持つ) */
+const REL_TYPES = ['blocks', 'relates'];
+const UI_KEY = 'tb.ui';
+const SEEN_KEY = 'tb.seen';
 const VIEWS = [['board', 'ボード'], ['list', 'リスト'], ['activity', '操作ログ'], ['members', 'メンバー'], ['settings', '設定']];
 const INLINE_TYPES = /^(image\/(png|jpeg|gif|webp|bmp)|application\/pdf|text\/plain)$/;
 
@@ -107,13 +117,42 @@ function fmtSize(n) {
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
+const KEY_RE = /\b[A-Z0-9]+-\d+\b/g;
+
+/** キーからチケットを探す。同じキーが複数あれば、アーカイブしていないもの → 作成が早いもの の順で選ぶ */
+function findByKey(key) {
+  let best = null;
+  for (const t of state.tickets.values()) {
+    if (t.key !== key) continue;
+    if (!best || (!!best.archived - !!t.archived || String(best.createdAt).localeCompare(String(t.createdAt)) || best.id.localeCompare(t.id)) > 0) best = t;
+  }
+  return best;
+}
+
+function keyLink(t, label) {
+  return h('button', { type: 'button', class: 'keylink', title: t.title, onclick: () => openTicket(t.id) }, label ?? t.key);
+}
+
+/** URL と、既存チケットのキー(TK-12 など)をリンクにする */
 function linkify(text) {
   const frag = document.createDocumentFragment();
-  for (const part of String(text ?? '').split(/(https?:\/\/[^\s<>"']+)/g)) {
-    if (/^https?:\/\//.test(part)) frag.append(h('a', { href: part, target: '_blank', rel: 'noopener noreferrer' }, part));
-    else if (part) frag.append(part);
+  for (const part of String(text ?? '').split(/(https?:\/\/[^\s<>"']+|\b[A-Z0-9]+-\d+\b)/g)) {
+    if (!part) continue;
+    if (/^https?:\/\//.test(part)) { frag.append(h('a', { href: part, target: '_blank', rel: 'noopener noreferrer' }, part)); continue; }
+    const t = /^[A-Z0-9]+-\d+$/.test(part) ? findByKey(part) : null;
+    frag.append(t ? keyLink(t, part) : part);
   }
   return frag;
+}
+
+/** 本文中で触れている既存チケット(重複なし、自分自身は除く) */
+function referencedTickets(text, selfId) {
+  const out = new Map();
+  for (const m of String(text ?? '').matchAll(KEY_RE)) {
+    const t = findByKey(m[0]);
+    if (t && t.id !== selfId) out.set(t.id, t);
+  }
+  return [...out.values()];
 }
 
 function shortUA() {
@@ -388,6 +427,9 @@ function normalizeTicket(t, id) {
   t.links = Array.isArray(t.links) ? t.links : [];
   t.comments = Array.isArray(t.comments) ? t.comments : [];
   t.history = Array.isArray(t.history) ? t.history : [];
+  t.checklist = Array.isArray(t.checklist) ? t.checklist.filter((c) => c && typeof c === 'object' && c.id) : [];
+  t.relations = Array.isArray(t.relations) ? t.relations.filter((r) => r && typeof r === 'object' && r.id && REL_TYPES.includes(r.type)) : [];
+  t.parent = typeof t.parent === 'string' ? t.parent : '';
   return t;
 }
 
@@ -613,7 +655,27 @@ const isDone = (t) => t.status === state.config.statuses[state.config.statuses.l
 const isOverdue = (t) => !!t.due && t.due < todayStr() && !isDone(t);
 const prioChip = (p) => (p ? h('span', { class: `chip p${prioIndex(p)}` }, p) : null);
 
+/** 表示・絞り込み・並べ替えをこのブラウザに保存する(共有フォルダには書かない) */
+function saveUi() {
+  lsSet(UI_KEY, { view: state.view, filters: state.filters, sort: state.sort });
+}
+/** 保存した表示を戻す。壊れた値や古い形式は無視し、知っている項目だけ型を確かめて取り込む */
+function restoreUi() {
+  const ui = lsGet(UI_KEY);
+  if (!ui || typeof ui !== 'object') return;
+  if (VIEWS.some(([id]) => id === ui.view)) state.view = ui.view;
+  if (ui.filters && typeof ui.filters === 'object') {
+    for (const [k, v] of Object.entries(state.filters)) {
+      if (typeof ui.filters[k] === typeof v) state.filters[k] = ui.filters[k];
+    }
+  }
+  if (ui.sort && typeof ui.sort.col === 'string' && (ui.sort.dir === 1 || ui.sort.dir === -1)) {
+    state.sort = { col: ui.sort.col, dir: ui.sort.dir };
+  }
+}
+
 function renderMain() {
+  saveUi();
   const main = $('main');
   const top = main.scrollTop;
   const views = { board: viewBoard, list: viewList, activity: viewActivity, members: viewMembers, settings: viewSettings };
@@ -980,7 +1042,11 @@ function renderTicketDialog() {
           }),
         }),
         h('div', { class: 'section-title' }, '説明'),
-        h('textarea', { rows: 6, value: t.description, placeholder: '説明を入力(フォーカスを外すと保存されます)', onchange: change('description') }),
+        h('textarea', { rows: 6, value: t.description, placeholder: `説明を入力(フォーカスを外すと保存されます)。${c.key}-12 のようにキーを書くとリンクになります`, onchange: change('description') }),
+        (() => {
+          const refs = referencedTickets(t.description, t.id);
+          return refs.length ? h('div', { class: 'refs' }, h('span', { class: 'note' }, '参照:'), refs.map((r) => keyLink(r, `${r.key} ${r.title}`))) : null;
+        })(),
 
         h('div', { class: 'section-title' }, '添付ファイル', h('span', { class: 'spacer' }),
           h('button', { class: 'btn small', onclick: () => picker.click() }, '＋ ファイルを追加'), picker),
@@ -1096,6 +1162,7 @@ async function start(root) {
 
   $('gate').hidden = true;
   $('app').hidden = false;
+  restoreUi();
   renderChrome();
   await refresh(true);
 
@@ -1119,6 +1186,28 @@ async function boot() {
   }
 }
 
+/* ================= キーボードショートカット ================= */
+
+const SHORTCUTS = 'C: チケット作成 / /: 検索 / Esc: ダイアログを閉じる / ?: この一覧';
+document.addEventListener('keydown', (e) => {
+  if ($('app').hidden || dlg.open || e.ctrlKey || e.altKey || e.metaKey || e.isComposing) return;
+  const a = document.activeElement;
+  if (a && (/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) || a.isContentEditable)) return;
+  if (e.key === 'c' || e.key === 'C') {
+    e.preventDefault();
+    openCreateDialog();
+  } else if (e.key === '/') {
+    e.preventDefault();
+    if (state.view !== 'board' && state.view !== 'list') { state.view = 'board'; renderChrome(); renderMain(); }
+    const q = $('filters').querySelector('input[type=search]');
+    if (q) q.focus();
+  } else if (e.key === '?') {
+    e.preventDefault();
+    toast(SHORTCUTS);
+  }
+});
+
+$('btnCreate').title = 'チケット作成 (C)';
 $('btnCreate').addEventListener('click', openCreateDialog);
 $('btnSync').addEventListener('click', guard(() => refresh(true)));
 boot();

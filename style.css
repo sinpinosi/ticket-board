@@ -234,3 +234,12 @@ td.wrap { overflow-wrap: anywhere; }
   z-index: 100; max-width: calc(100vw - 32px);
 }
 .toast.error { background: var(--danger); color: #fff; }
+
+/* ---------- チケットキーのリンク ---------- */
+.keylink {
+  border: 0; background: none; padding: 0; cursor: pointer;
+  color: var(--accent); font-weight: 600; text-decoration: underline; text-underline-offset: 2px;
+}
+.keylink:hover { filter: brightness(1.2); }
+.refs { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin-top: 4px; font-size: 12px; }
+.refs .keylink { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
