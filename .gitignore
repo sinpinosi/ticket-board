@@ -1,0 +1,9 @@
+# このフォルダをデータ保存先に選んだ場合に作られるファイル
+/config.json
+/tickets/
+/attachments/
+/users/
+/logs/
+*.crswap
+
+node_modules/
