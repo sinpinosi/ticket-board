@@ -697,7 +697,14 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
 
   // 種別ごとのキー接頭辞: バグだけ BUG、番号は全体の通し番号。種別を変えてもキーは変わらない
   await page.click('#nav >> text=設定');
-  assert.strictEqual(await page.locator('.panel label:text-is("チケットのステータス(1行に1つ。左から順にボードの列になり、最後の行が「完了」扱い)")').count(), 1);
+  assert.strictEqual(await page.locator('.panel label.has-help:has-text("チケットのステータス")').count(), 1);
+  // 説明は「?」を押すまで隠れている
+  const typeHelp = page.locator('.panel label.has-help:has-text("種別") + .help-text');
+  assert.ok(await typeHelp.isHidden(), '説明は最初は隠すこと');
+  await page.click('.panel label.has-help:has-text("種別") .help-btn');
+  assert.ok((await typeHelp.innerText()).includes('通し番号'), '「?」で説明を開くこと');
+  await page.click('.panel label.has-help:has-text("種別") .help-btn');
+  assert.ok(await typeHelp.isHidden(), 'もう一度押すと閉じること');
   assert.strictEqual(await page.locator('.panel label:text-is("チケットキーの接頭辞(既定)")').count(), 0, '既定の接頭辞の欄は出さないこと');
   assert.strictEqual(await page.getAttribute('.type-table input[data-type="タスク"]', 'placeholder'), 'TK', '空欄の種別は既定の TK を使うこと');
   await page.fill('.type-table input[data-type="バグ"]', 'bug!');

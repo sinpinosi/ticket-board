@@ -1671,6 +1671,23 @@ function viewMembers() {
 
 /* ================= 画面: 設定 ================= */
 
+/**
+ * 見出し(label・h2・h3)の横に「?」ボタンを付け、押すと説明を開く(もう一度押すと閉じる)。
+ * 長い説明で画面が埋まらないようにするため。マウスを乗せたときも title で読める
+ */
+function withHelp(tag, text, help) {
+  const tip = h('div', { class: 'help-text', hidden: true }, help);
+  const btn = h('button', {
+    type: 'button', class: 'help-btn', title: help, 'aria-label': `${text}の説明`, 'aria-expanded': 'false',
+    onclick: (e) => {
+      e.preventDefault();
+      tip.hidden = !tip.hidden;
+      btn.setAttribute('aria-expanded', String(!tip.hidden));
+    },
+  }, '?');
+  return [h(tag, { class: 'has-help' }, text, btn), tip];
+}
+
 function viewSettings() {
   const c = state.config;
   const name = h('input', { type: 'text', value: c.projectName, maxLength: 60 });
@@ -1743,10 +1760,9 @@ function viewSettings() {
       h('h2', null, 'プロジェクト設定'),
       h('div', { class: 'note' }, '全メンバーに反映されます(共有フォルダの config.json)。'),
       h('label', null, 'ボード名(画面の左上とタブに表示)'), name,
-      h('label', null, 'チケットのステータス(1行に1つ。左から順にボードの列になり、最後の行が「完了」扱い)'), statuses,
-      h('label', null, '種別'), typeTable,
-      h('div', { class: 'note' }, `チケットのキーは「接頭辞-番号」です(例: ${c.key}-12)。接頭辞が空欄の種別は ${c.key} を使います。接頭辞は変更後に作成するチケットから適用し、作成後に種別を変えてもキーは変わりません。番号は種別にかかわらず通し番号です。`),
-      h('label', null, 'プロジェクトのステータス(1行に1つ。最後の行が「完了」扱いで、完了したプロジェクトのチケットはボード・リストに出なくなります)'), projectStatuses,
+      withHelp('label', 'チケットのステータス', '1行に1つ書きます。上から順にボードの左からの列になり、最後の行が「完了」扱いです。'), statuses,
+      withHelp('label', '種別', `チケットのキーは「接頭辞-番号」です(例: ${c.key}-12)。接頭辞が空欄の種別は ${c.key} を使います。接頭辞は変更後に作成するチケットから適用し、作成後に種別を変えてもキーは変わりません。番号は種別にかかわらず通し番号です。行の順がチケット作成時の選択肢の順になります。`), typeTable,
+      withHelp('label', 'プロジェクトのステータス', '1行に1つ書きます。最後の行が「完了」扱いで、完了したプロジェクトのチケットはボード・リストに出なくなります。'), projectStatuses,
       h('div', { class: 'note' }, 'プロジェクトの作成・名前の変更は「プロジェクト」画面で行います。'),
       h('div', { class: 'toolbar' }, h('button', { class: 'btn primary', onclick: saveConfig }, '保存'))),
     templatePanel(),
@@ -1894,8 +1910,7 @@ function userIdSection() {
     toast(`「${u.name || u.id}」として使います`);
   });
   return h('div', { class: 'user-id' },
-    h('h3', null, '利用者ID'),
-    h('div', { class: 'note' }, 'このブラウザでのあなたの利用者IDです。別の PC やブラウザでも同じ人として使うときは、そちらで下の欄にこの ID を入力してください。'),
+    withHelp('h3', '利用者ID', 'このブラウザでのあなたの利用者IDです。別の PC やブラウザでも同じ人として使うときは、そちらの「別の端末で使っている利用者IDを引き継ぐ」欄にこの ID を入力してください。'),
     h('div', { class: 'row' }, h('div', { class: 'path', 'data-testid': 'my-id' }, state.me.id),
       h('button', { class: 'btn small', onclick: guard(async () => { await navigator.clipboard.writeText(state.me.id); toast('利用者IDをコピーしました'); }) }, 'コピー')),
     h('label', null, '別の端末で使っている利用者IDを引き継ぐ'),
@@ -3058,8 +3073,7 @@ function shortcutPanel() {
       stopCapture = stop;
     };
     panel.replaceChildren(
-      h('h2', null, 'キーボードショートカット'),
-      h('div', { class: 'note' }, 'このブラウザだけに保存されます(他のメンバーには影響しません)。入力欄にカーソルがあるときは反応しません。'),
+      withHelp('h2', 'キーボードショートカット', '「変更」を押してから、割り当てたいキーを押します(Esc で取り消し)。割り当てはこのブラウザだけに保存され、他のメンバーには影響しません。入力欄にカーソルがあるときは反応しません。'),
       h('table', { class: 'shortcuts shortcut-edit' }, h('tbody', null,
         SHORTCUT_ACTIONS.map((x) => {
           const btn = h('button', { type: 'button', class: 'btn small', 'data-action': x.id }, '変更');

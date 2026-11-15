@@ -347,6 +347,16 @@ kbd.none { color: var(--muted); border-style: dashed; }
   .shortcut-edit td:first-child { grid-column: 1 / -1; width: auto; }
 }
 
+/* ---------- 説明の「?」ボタン ---------- */
+.has-help { display: flex; align-items: center; gap: 6px; }
+.help-btn {
+  display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto;
+  width: 18px; height: 18px; padding: 0; border-radius: 50%; border: 1px solid var(--border);
+  background: var(--surface-2); color: var(--muted); font-size: 11px; font-weight: 700; line-height: 1; cursor: pointer;
+}
+.help-btn:hover, .help-btn[aria-expanded="true"] { color: var(--accent); border-color: var(--accent); }
+.help-text { font-size: 12px; color: var(--muted); background: var(--surface-2); border-radius: 6px; padding: 6px 10px; margin: 0 0 6px; }
+
 /* ---------- 設定: 種別の表・利用者ID ---------- */
 .type-table table { width: 100%; border-collapse: collapse; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 6px; }
 .type-table th { text-align: left; font-size: 12px; font-weight: 600; color: var(--muted); background: var(--surface-2); padding: 6px 8px; border-bottom: 1px solid var(--border); }
