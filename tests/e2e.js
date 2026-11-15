@@ -682,7 +682,7 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   assert.strictEqual(await page.inputValue(`${pjRow('Aプロジェクト')} select`), '完了', '設定を保存してもプロジェクトのステータスが残ること');
   // 完了扱いのステータス(最後の行)の名前を変えたら、完了済みのプロジェクトを読み替える
   await page.click('#nav >> text=設定');
-  await page.fill('.panel textarea >> nth=2', '計画中\n進行中\n保留\n終了');
+  await page.fill('.panel textarea >> nth=1', '計画中\n進行中\n保留\n終了');
   await page.click('.panel >> text=保存 >> nth=0');
   await page.waitForSelector('#toast:has-text("設定を保存しました")');
   assert.ok(dialogs.at(-1).includes('「完了」から「終了」'), `確認の文言: ${dialogs.at(-1)}`);
@@ -698,10 +698,17 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   // 種別ごとのキー接頭辞: バグだけ BUG、番号は全体の通し番号。種別を変えてもキーは変わらない
   await page.click('#nav >> text=設定');
   assert.strictEqual(await page.locator('.panel label:text-is("チケットのステータス(1行に1つ。左から順にボードの列になり、最後の行が「完了」扱い)")').count(), 1);
-  await page.fill('.type-keys input[data-type="バグ"]', 'bug!');
+  assert.strictEqual(await page.locator('.panel label:text-is("チケットキーの接頭辞(既定)")').count(), 0, '既定の接頭辞の欄は出さないこと');
+  assert.strictEqual(await page.getAttribute('.type-table input[data-type="タスク"]', 'placeholder'), 'TK', '空欄の種別は既定の TK を使うこと');
+  await page.fill('.type-table input[data-type="バグ"]', 'bug!');
+  // 種別の表で行を足し、空の行は保存時に捨てる
+  await page.click('.type-table button:text-is("＋ 種別を追加")');
+  await page.fill('.type-table tbody tr:last-child .type-name', '調査');
+  await page.click('.type-table button:text-is("＋ 種別を追加")');
   await page.click('.panel >> text=保存 >> nth=0');
   await page.waitForSelector('#toast:has-text("設定を保存しました")');
-  assert.strictEqual(await page.inputValue('.type-keys input[data-type="バグ"]'), 'BUG', '接頭辞は英大文字と数字にそろえること');
+  assert.strictEqual(await page.inputValue('.type-table input[data-type="バグ"]'), 'BUG', '接頭辞は英大文字と数字にそろえること');
+  assert.deepStrictEqual(await page.locator('.type-table .type-name').evaluateAll((els) => els.map((e) => e.value)), ['タスク', 'バグ', '要望', '問い合わせ', '調査']);
   await page.click('#nav >> text=ボード');
   await page.keyboard.press('c');
   await page.waitForSelector('#dlg.narrow[open]');

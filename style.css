@@ -347,11 +347,20 @@ kbd.none { color: var(--muted); border-style: dashed; }
   .shortcut-edit td:first-child { grid-column: 1 / -1; width: auto; }
 }
 
-/* ---------- 設定: 種別ごとの接頭辞・利用者ID ---------- */
-.type-keys { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 6px 12px; }
-.panel .type-key { display: flex; align-items: center; gap: 8px; margin: 0; }
-.type-key-name { flex: 0 0 auto; max-width: 50%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
-.type-key input { flex: 1 1 auto; min-width: 0; }
+/* ---------- 設定: 種別の表・利用者ID ---------- */
+.type-table table { width: 100%; border-collapse: collapse; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 6px; }
+.type-table th { text-align: left; font-size: 12px; font-weight: 600; color: var(--muted); background: var(--surface-2); padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.type-table td { padding: 4px 6px; border-bottom: 1px solid var(--border); }
+.type-table tr:last-child td { border-bottom: none; }
+.type-table th:nth-child(2), .type-table td:nth-child(2) { width: 9em; }
+.type-table td:nth-child(3) { width: 1%; text-align: right; }
+.type-table input { width: 100%; min-width: 0; }
+.type-table .type-prefix { text-transform: uppercase; }
+@media (max-width: 600px) {
+  .type-table th:nth-child(2), .type-table td:nth-child(2) { width: 5.5em; }
+  .type-table td { padding: 4px 3px; }
+}
+.type-table .type-prefix::placeholder { text-transform: none; }
 .user-id { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }
 .user-id h3 { margin: 0 0 4px; font-size: 14px; }
 

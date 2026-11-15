@@ -1674,35 +1674,51 @@ function viewMembers() {
 function viewSettings() {
   const c = state.config;
   const name = h('input', { type: 'text', value: c.projectName, maxLength: 60 });
-  const key = h('input', { type: 'text', value: c.key, maxLength: 10 });
   const statuses = h('textarea', { rows: 5, value: c.statuses.join('\n') });
-  const types = h('textarea', { rows: 4, value: c.types.join('\n') });
   const projectStatuses = h('textarea', { rows: 4, value: c.projectStatuses.join('\n') });
   const lines = (el) => [...new Set(el.value.split('\n').map((s) => s.trim()).filter(Boolean))];
 
-  // 種別ごとの接頭辞。種別の欄を書き換えたら表を作り直す(入力済みの値は種別名で引き継ぐ)
-  const typeKeyDraft = new Map(Object.entries(c.typeKeys));
-  const typeKeyTable = h('div', { class: 'type-keys' });
-  const renderTypeKeys = () => {
-    typeKeyTable.replaceChildren(...lines(types).map((t) => h('label', { class: 'type-key' },
-      h('span', { class: 'type-key-name' }, t),
-      h('input', {
-        type: 'text', maxLength: 10, value: typeKeyDraft.get(t) || '', placeholder: `既定(${cleanPrefix(key.value) || DEFAULT_CONFIG.key})`,
-        'data-type': t, oninput: (e) => typeKeyDraft.set(t, e.target.value),
-      }))));
+  // 種別の表(種別名と、その種別のキー接頭辞)。行の並びがチケット作成時の選択肢の順になる。
+  // 接頭辞が空欄の種別は既定の接頭辞(config.key。初期値 TK)を使う。既定の接頭辞はこの画面では変えない
+  const typeRows = c.types.map((t) => ({ name: t, prefix: Object.hasOwn(c.typeKeys, t) ? c.typeKeys[t] : '' }));
+  const typeBody = h('tbody');
+  const renderTypeRows = () => {
+    typeBody.replaceChildren(...typeRows.map((r, i) => {
+      const move = (d) => { [typeRows[i], typeRows[i + d]] = [typeRows[i + d], typeRows[i]]; renderTypeRows(); };
+      return h('tr', null,
+        h('td', null, h('input', { type: 'text', class: 'type-name', maxLength: 40, value: r.name, placeholder: '種別名', 'aria-label': '種別名', oninput: (e) => { r.name = e.target.value; } })),
+        h('td', null, h('input', {
+          type: 'text', class: 'type-prefix', maxLength: 10, value: r.prefix, placeholder: c.key, 'aria-label': 'キーの接頭辞', 'data-type': r.name,
+          oninput: (e) => { r.prefix = e.target.value; },
+          // 英大文字と数字にそろえて見せる
+          onchange: (e) => { r.prefix = cleanPrefix(e.target.value); e.target.value = r.prefix; },
+        })),
+        h('td', { class: 'nowrap' },
+          h('button', { type: 'button', class: 'btn small ghost', title: '上へ', disabled: i === 0, onclick: () => move(-1) }, '↑'),
+          h('button', { type: 'button', class: 'btn small ghost', title: '下へ', disabled: i === typeRows.length - 1, onclick: () => move(1) }, '↓'),
+          h('button', { type: 'button', class: 'btn small ghost', title: 'この種別を削除', onclick: () => { typeRows.splice(i, 1); renderTypeRows(); } }, '✕')));
+    }));
   };
-  types.addEventListener('input', renderTypeKeys);
-  key.addEventListener('input', renderTypeKeys);
-  renderTypeKeys();
+  renderTypeRows();
+  const typeTable = h('div', { class: 'type-table' },
+    h('table', null,
+      h('thead', null, h('tr', null, h('th', null, '種別'), h('th', null, 'キーの接頭辞'), h('th'))),
+      typeBody),
+    h('button', {
+      type: 'button', class: 'btn small',
+      onclick: () => { typeRows.push({ name: '', prefix: '' }); renderTypeRows(); typeBody.querySelector('tr:last-child .type-name').focus(); },
+    }, '＋ 種別を追加'));
 
   const saveConfig = guard(async () => {
     const fields = {
       projectName: name.value.trim() || DEFAULT_CONFIG.projectName,
-      key: cleanPrefix(key.value) || DEFAULT_CONFIG.key,
-      statuses: lines(statuses), types: lines(types), projectStatuses: lines(projectStatuses),
+      statuses: lines(statuses), projectStatuses: lines(projectStatuses),
     };
-    // 今の種別にあるものだけ残す(種別名を変えた・消したものの接頭辞は捨てる)
-    fields.typeKeys = Object.fromEntries(fields.types.map((t) => [t, cleanPrefix(typeKeyDraft.get(t))]).filter(([, p]) => p));
+    // 種別名が空の行は捨て、同じ名前が2行あれば上の行を使う
+    const seen = new Map();
+    for (const r of typeRows) { const n = r.name.trim(); if (n && !seen.has(n)) seen.set(n, cleanPrefix(r.prefix)); }
+    fields.types = [...seen.keys()];
+    fields.typeKeys = Object.fromEntries([...seen].filter(([, p]) => p));
     if (fields.statuses.length < 2) { toast('チケットのステータスは2つ以上必要です', true); return; }
     if (!fields.types.length) { toast('種別は1つ以上必要です', true); return; }
     if (fields.projectStatuses.length < 2) { toast('プロジェクトのステータスは2つ以上必要です', true); return; }
@@ -1728,10 +1744,8 @@ function viewSettings() {
       h('div', { class: 'note' }, '全メンバーに反映されます(共有フォルダの config.json)。'),
       h('label', null, 'ボード名(画面の左上とタブに表示)'), name,
       h('label', null, 'チケットのステータス(1行に1つ。左から順にボードの列になり、最後の行が「完了」扱い)'), statuses,
-      h('label', null, '種別(1行に1つ)'), types,
-      h('label', null, 'チケットキーの接頭辞(既定)'), key,
-      h('label', null, '種別ごとの接頭辞(空欄は既定の接頭辞を使います)'), typeKeyTable,
-      h('div', { class: 'note' }, '接頭辞は変更後に作成するチケットから適用します。作成後に種別を変えてもキーは変わりません。番号は種別にかかわらず通し番号です。種別の名前を変えたときは、接頭辞を設定し直してください。'),
+      h('label', null, '種別'), typeTable,
+      h('div', { class: 'note' }, `チケットのキーは「接頭辞-番号」です(例: ${c.key}-12)。接頭辞が空欄の種別は ${c.key} を使います。接頭辞は変更後に作成するチケットから適用し、作成後に種別を変えてもキーは変わりません。番号は種別にかかわらず通し番号です。`),
       h('label', null, 'プロジェクトのステータス(1行に1つ。最後の行が「完了」扱いで、完了したプロジェクトのチケットはボード・リストに出なくなります)'), projectStatuses,
       h('div', { class: 'note' }, 'プロジェクトの作成・名前の変更は「プロジェクト」画面で行います。'),
       h('div', { class: 'toolbar' }, h('button', { class: 'btn primary', onclick: saveConfig }, '保存'))),
