@@ -22,6 +22,11 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   let dismissNext = false;
   page.on('dialog', (d) => { dialogs.push(d.message()); if (dismissNext) { dismissNext = false; d.dismiss(); } else d.accept(); });
   const closeDialog = () => page.click('#dlg .dlg-head >> text=✕');
+  // 中身が0件のセクションは「＋ 追加」を押すまで入力欄が出ない
+  const openSection = async (name) => {
+    const b = page.locator(`#dlg [data-section="${name}"] .section-title button:text-is("＋ 追加")`);
+    if (await b.count()) await b.click();
+  };
 
   /*
    * お試しモードの保存先(IndexedDB の demo ストア)を直接操作して、他のメンバーの書き込みを再現する。
@@ -65,13 +70,17 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   await page.fill('#dlg input[type=text]', 'ログイン画面のバグ <b>x</b>');
   await page.click('#dlg button[type=submit]');
   await page.waitForSelector('.ticket-main');
-  await page.fill('.ticket-main textarea >> nth=0', '説明です https://example.com');
+  // 説明はふだんは表示で、押すと編集。欄の外に出ると保存して、URL がリンクになる
+  assert.strictEqual(await page.locator('.ticket-main .desc-edit').count(), 0, '最初は表示のみ');
+  await page.click('.ticket-main .desc-view');
+  await page.fill('.ticket-main .desc-edit', '説明です https://example.com');
   await page.selectOption('.ticket-side select >> nth=0', '進行中');
   await page.selectOption('.ticket-side select >> nth=1', { label: '山田 太郎' });
   await page.fill('.ticket-side input[type=date]', '2020-01-01');
   await page.fill('.ticket-side input[type=text]', 'UI, 緊急');
   await page.locator('.ticket-side input[type=text]').blur();
   await page.waitForTimeout(300);
+  assert.strictEqual(await page.locator('.ticket-main .desc-view a').getAttribute('href'), 'https://example.com', '説明の URL がリンクになること');
 
   // 添付(同名ファイルは連番が付く)
   await page.setInputFiles('#dlg input[type=file]', [
@@ -81,7 +90,9 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   await page.waitForSelector('.file-list button.name >> nth=1');
   assert.deepStrictEqual(await page.locator('.file-list .name').allTextContents(), ['a (2).txt', 'a.txt']);
 
-  // リンクとコメント
+  // リンクとコメント(0件のリンク欄は畳まれている)
+  assert.ok(await page.locator('#dlg input[type=url]').isHidden(), '0件のセクションは入力欄を畳むこと');
+  await openSection('link');
   await page.fill('#dlg input[type=url]', 'https://app.box.com/s/abc');
   await page.click('#dlg .row:has(input[type=url]) >> text=追加');
   await page.waitForSelector('.link-list a');
@@ -90,6 +101,27 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   await page.waitForSelector('.comment');
   assert.strictEqual(await page.locator('.comment a').getAttribute('href'), 'https://x.test');
   assert.strictEqual(await page.locator('.history li').count(), 8, '変更履歴の件数');
+  // 自分のコメントは編集できる(「編集済み」が付く)。消すときは確認を出す
+  await page.click('.comment >> nth=0 >> .comment-actions >> text=編集');
+  await page.fill('#dlg textarea[data-draft^=cedit]', 'コメント1(修正) https://x.test');
+  await page.click('.comment >> nth=0 >> text=保存');
+  await page.waitForSelector('.comment .pre:has-text("コメント1(修正)")');
+  assert.ok((await page.innerText('.comment >> nth=0')).includes('(編集済み)'));
+  await page.fill('#dlg textarea[placeholder^=コメント]', '消すコメント');
+  await page.click('text=コメントする');
+  await page.waitForSelector('.comment:has-text("消すコメント")');
+  await page.click('.comment:has-text("消すコメント") .comment-actions >> text=削除');
+  await page.waitForFunction(() => document.querySelectorAll('.comment').length === 1);
+  assert.ok(dialogs.at(-1).includes('コメントを削除'), `確認の文言: ${dialogs.at(-1)}`);
+  // E で説明を編集、Esc で保存してダイアログは閉じない
+  await page.locator('.ticket-main .section-title >> nth=0').click();
+  await page.keyboard.press('e');
+  assert.strictEqual(await page.evaluate(() => document.activeElement.className), 'desc-edit');
+  await page.keyboard.type(' 追記');
+  await page.keyboard.press('Escape');
+  await page.waitForSelector('#toast:has-text("説明を保存しました")');
+  assert.ok(await page.locator('#dlg[open]').count() === 1, 'Esc で説明を保存してもダイアログは閉じないこと');
+  assert.ok((await page.innerText('.ticket-main .desc-view')).includes('追記'));
   await closeDialog();
   assert.strictEqual(await page.locator('.card .title >> nth=0').textContent(), 'ログイン画面のバグ <b>x</b>');
   assert.strictEqual(await page.locator('.card b').count(), 0, 'タイトルが HTML として解釈されていないこと');
@@ -100,6 +132,10 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   await page.fill('#dlg input[type=text]', '2つ目');
   await page.click('#dlg button[type=submit]');
   await page.waitForSelector('.ticket-main');
+  // 他のチケットのラベルが候補に出て、押すと足せる
+  await page.click('.ticket-side .label-suggest button:text-is("＋UI")');
+  await page.waitForSelector('.ticket-side .label-suggest button:text-is("＋UI")', { state: 'detached' }); // 保存後の描き直しを待つ
+  assert.strictEqual(await page.inputValue('.ticket-side input[type=text]'), 'UI');
 
   // コメント中のキーがリンクになり、押すとそのチケットが開く
   await page.fill('#dlg textarea[placeholder^=コメント]', 'TK-1 と同じ原因。TK-999 は存在しない');
@@ -110,12 +146,26 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   await page.waitForSelector('#dlg .dlg-head .key:text-is("TK-1")');
   await closeDialog();
 
+  // カードのラベルを押すとそのラベルで絞り込み、「絞り込み中」から解除できる
+  await page.click('.card:has-text("ログイン画面") .chip.label:text-is("緊急")');
+  assert.strictEqual(await page.locator('.card').count(), 1);
+  assert.strictEqual(await page.inputValue('#labelFilter'), '緊急');
+  assert.ok(await page.locator('#dlg[open]').count() === 0, 'ラベルを押してもチケットは開かないこと');
+  await page.click('#filterState >> text=クリア');
+  assert.strictEqual(await page.locator('.card').count(), 2);
+  assert.strictEqual(await page.locator('#filterState button').count(), 0, '絞り込みが無ければ表示しない');
+
   // ドラッグで「完了」へ移動
+  const columnKeys = () => page.locator('.column').evaluateAll((cols) =>
+    cols.map((c) => [...c.querySelectorAll('.card .key')].map((k) => k.textContent)));
+  // 誤って落としたら「元に戻す」で戻せる
+  await page.dragAndDrop('.card:has-text("2つ目")', '.column >> nth=3');
+  await page.click('#toast .toast-action:text-is("元に戻す")');
+  await page.waitForSelector('#toast:has-text("戻しました")');
+  assert.deepStrictEqual(await columnKeys(), [['TK-2'], ['TK-1'], [], []], '元に戻すこと');
   await page.dragAndDrop('.card:has-text("2つ目")', '.column >> nth=3');
   await page.waitForTimeout(400);
-  const columns = await page.locator('.column').evaluateAll((cols) =>
-    cols.map((c) => [...c.querySelectorAll('.card .key')].map((k) => k.textContent)));
-  assert.deepStrictEqual(columns, [[], ['TK-1'], [], ['TK-2']]);
+  assert.deepStrictEqual(await columnKeys(), [[], ['TK-1'], [], ['TK-2']]);
 
   // 再読み込み後もデータと絞り込みが残ること
   await page.check('text=自分の担当のみ');
@@ -123,8 +173,28 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   await page.waitForSelector('.card');
   assert.ok(await page.isChecked('text=自分の担当のみ'), '絞り込みが記憶されていること');
   assert.strictEqual(await page.locator('.card').count(), 1);
-  await page.uncheck('text=自分の担当のみ');
+  assert.ok((await page.innerText('#filterState')).includes('絞り込み中'), '記憶した絞り込みを知らせること');
+  await page.click('#filterState >> text=クリア');
+  assert.ok(!(await page.isChecked('text=自分の担当のみ')));
   assert.strictEqual(await page.locator('.card').count(), 2);
+
+  // 検索はコメントの中身も対象
+  await page.fill('#filters input[type=search]', 'x.test');
+  assert.strictEqual(await page.locator('.card').count(), 1);
+  await page.fill('#filters input[type=search]', '');
+
+  // J/K で選んで Enter で開く。? でショートカットの一覧
+  await page.locator('body').click({ position: { x: 5, y: 5 } });
+  await page.keyboard.press('j');
+  assert.strictEqual(await page.locator('.card.cursor').count(), 1);
+  const cursorKey = await page.textContent('.card.cursor .key');
+  await page.keyboard.press('Enter');
+  await page.waitForSelector(`#dlg .dlg-head .key:text-is("${cursorKey}")`);
+  await closeDialog();
+  await page.locator('body').click({ position: { x: 5, y: 5 } });
+  await page.keyboard.press('?');
+  await page.waitForSelector('#dlg .shortcuts');
+  await closeDialog();
 
   // "/" で検索欄にフォーカスが移る
   await page.locator('body').click({ position: { x: 5, y: 5 } });
@@ -135,13 +205,14 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
 
   // リスト・操作ログ・メンバー
   await page.click('#nav >> text=リスト');
-  assert.strictEqual(await page.locator('tbody tr').count(), 2);
+  assert.strictEqual(await page.locator('#main tbody tr').count(), 2);
   await page.click('#nav >> text=操作ログ');
   await page.waitForSelector('tbody tr');
-  assert.ok((await page.locator('tbody tr').count()) >= 12, '操作ログが記録されていること');
-  assert.ok((await page.locator('tbody tr >> nth=0').innerText()).includes('PC-001'));
+  assert.ok((await page.locator('#main tbody tr').count()) >= 12, '操作ログが記録されていること');
+  assert.ok((await page.locator('#main tbody tr >> nth=0').innerText()).includes('PC-001'));
+  assert.ok((await page.locator('#main tbody .keylink').count()) > 0, '操作ログの対象のキーから開けること');
   await page.click('#nav >> text=メンバー');
-  const memberRow = await page.locator('tbody tr').innerText();
+  const memberRow = await page.locator('#main tbody tr').innerText();
   assert.ok(/山田 太郎[\s\S]*u-[a-z0-9]{8}/.test(memberRow), `メンバーに名前と自動の利用者IDが出ること: ${memberRow}`);
 
   // 設定変更(ステータスを減らす)
@@ -155,6 +226,7 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   // チェックリスト: 2項目追加して1つ完了 → カードに ☑ 1/2
   await page.click('.card:has-text("ログイン画面")');
   await page.waitForSelector('.ticket-main');
+  await openSection('checklist');
   for (const text of ['原因を調べる', '直す']) {
     await page.fill('#dlg .checklist-add input', text);
     await page.press('#dlg .checklist-add input', 'Enter');
@@ -168,7 +240,8 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   await page.fill('#dlg textarea[placeholder^=コメント]', '');
 
   // 関連: 既存の TK-2 をサブチケットにする(関連欄ではなくサブチケット欄に出る)。自分自身は登録できない
-  const relRow = '#dlg .ticket-main .row:has(select)';
+  const relRow = '#dlg .ticket-main .rel-add';
+  await openSection('rel');
   await page.selectOption(`${relRow} select`, 'child');
   await page.fill(`${relRow} input`, 'TK-2');
   await page.click(`${relRow} >> text=追加`);
@@ -293,6 +366,7 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   assert.strictEqual(await page.inputValue('.ticket-side select:has(option[value="Web"])'), 'Web');
 
   // サブチケット: 親の詳細から作る → ボード・リストに出ず、親に数が出る
+  await openSection('sub');
   for (const title of ['サブ作業1', 'サブ作業2']) {
     await page.fill('#dlg .sub-add input', title);
     await page.press('#dlg .sub-add input', 'Enter');
@@ -321,7 +395,7 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   await page.selectOption(projectFilter, 'Web');
   assert.strictEqual(await page.locator('.card').count(), 1);
   await page.click('#nav >> text=リスト');
-  assert.strictEqual(await page.locator('tbody tr').count(), 1, 'リストにもサブを出さない');
+  assert.strictEqual(await page.locator('#main tbody tr').count(), 1, 'リストにもサブを出さない');
   assert.ok((await page.innerText('thead')).includes('プロジェクト'));
   await page.click('#nav >> text=ボード');
   await page.selectOption(projectFilter, '__none');
@@ -331,7 +405,8 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
 
   // エラーチェック: 関連の追加で、形式違い・存在しないキー・アーカイブ済みのキーはエラー
   await page.click(webCard);
-  const relRow2 = '#dlg .ticket-main .row:has(select)';
+  const relRow2 = '#dlg .ticket-main .rel-add';
+  await openSection('rel');
   for (const [input, msg] of [['abc', 'チケットのキーではありません'], ['TK-999', 'TK-999 というチケットは見つかりません'], ['TK-2', 'アーカイブ済み'], ['', 'キーを入力してください']]) {
     await page.fill(`${relRow2} input`, input);
     await page.click(`${relRow2} >> text=追加`);
@@ -339,8 +414,9 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   }
   assert.strictEqual(await page.locator('#dlg .rel-list li').count(), 0);
   // 説明に存在しないキーを書くと知らせる
-  await page.fill('.ticket-main textarea >> nth=0', 'TK-1 と TK-998 を参照');
-  await page.locator('.ticket-main textarea >> nth=0').blur();
+  await page.click('.ticket-main .desc-view');
+  await page.fill('.ticket-main .desc-edit', 'TK-1 と TK-998 を参照');
+  await page.locator('.ticket-main .desc-edit').blur();
   await page.waitForSelector('#dlg .refs .warn:has-text("TK-998")');
   assert.ok(!(await page.innerText('#dlg .refs .warn')).includes('TK-1,'), '存在するキーは警告しない');
   // 空のサブチケットはエラー
@@ -383,6 +459,40 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   await page.waitForFunction(() => !document.querySelector('#dlg .dlg-head .warn'));
   assert.strictEqual(await page.locator('#dlg .rel-list li:has-text("親チケット")').count(), 0, 'OK なら外すこと');
   await closeDialog();
+
+  // 作成して続ける: 詳細を開かずに続けて入力できる
+  const before = await page.locator('.card').count();
+  await page.click('#btnCreate');
+  for (const title of ['まとめて1', 'まとめて2']) {
+    await page.fill('#dlg input[type=text]', title);
+    await page.click('#dlg >> text=作成して続ける');
+    await page.waitForSelector(`#toast:has-text("「${title}」を作成しました")`);
+    assert.strictEqual(await page.inputValue('#dlg input[type=text]'), '', 'タイトル欄を空にすること');
+  }
+  await closeDialog();
+  assert.strictEqual(await page.locator('.card').count(), before + 2);
+  // 自分に割り当て・期限が近いものの強調
+  await page.click('.card:has-text("まとめて1")');
+  await page.click('.ticket-side .assign-me');
+  await page.waitForSelector('.ticket-side .assign-me', { state: 'detached' });
+  assert.strictEqual(await page.inputValue('.ticket-side select >> nth=1'), await page.evaluate(() => JSON.parse(localStorage.getItem('tb.me')).id));
+  const d = new Date();
+  await page.fill('.ticket-side input[type=date]', `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`);
+  await page.locator('.ticket-side input[type=date]').blur();
+  await page.waitForTimeout(300);
+  // 詳細ダイアログを開いたままでも「元に戻す」を押せる
+  await page.selectOption('.ticket-side select >> nth=0', '進行中');
+  await page.click('#toast .toast-action:text-is("元に戻す")');
+  await page.waitForSelector('#toast:has-text("戻しました")');
+  assert.strictEqual(await page.inputValue('.ticket-side select >> nth=0'), '未着手', 'ダイアログの中でも元に戻せること');
+  // 他の人がその後に変えていたら戻さない
+  await page.selectOption('.ticket-side select >> nth=0', '進行中');
+  await page.waitForSelector('#toast .toast-action');
+  await demoWrite({ key: await page.textContent('#dlg .dlg-head .key'), patch: { status: '完了' } });
+  await page.click('#toast .toast-action:text-is("元に戻す")');
+  await page.waitForSelector('#toast:has-text("他の人が変更したため戻しませんでした")');
+  await closeDialog();
+  assert.strictEqual(await page.locator('.card:has-text("まとめて1") .due.soon').count(), 1, '今日が期限なら強調すること');
 
   // 利用者ID: 設定に自分の ID が出る。存在しない ID は引き継げない
   await page.click('#nav >> text=設定');

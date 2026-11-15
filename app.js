@@ -36,6 +36,8 @@ const ACTION_LABELS = {
   'ticket.create': 'チケット作成',
   'ticket.update': 'チケット更新',
   'comment.add': 'コメント追加',
+  'comment.edit': 'コメント編集',
+  'comment.remove': 'コメント削除',
   'attachment.add': '添付追加',
   'attachment.remove': '添付削除',
   'link.add': 'リンク追加',
@@ -65,11 +67,15 @@ const state = {
   fileMeta: new Map(),
   users: new Map(),
   view: 'board',
-  filters: { q: '', project: '', assignee: '', type: '', priority: '', mine: false, unread: false, archived: false },
+  filters: { q: '', project: '', assignee: '', type: '', priority: '', label: '', mine: false, unread: false, archived: false },
   seen: {},
   seenKey: '',
   sort: { col: 'updatedAt', dir: -1 },
   openId: null,
+  /** キーボード(J/K)で選んでいるチケットの id */
+  cursor: null,
+  /** 詳細ダイアログの表示状態(開いているチケットが変わったら戻す) */
+  detail: { id: null, open: new Set(), descEditing: false, editComment: null },
   activity: { month: '', user: '' },
 };
 
@@ -113,8 +119,10 @@ function fmtDateTime(iso) {
   if (isNaN(d)) return String(iso);
   return `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
-function todayStr() {
+/** 今日から days 日後の日付(YYYY-MM-DD、ローカル時刻) */
+function todayStr(days = 0) {
   const d = new Date();
+  d.setDate(d.getDate() + days);
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 function monthStr() { return todayStr().slice(0, 7); }
@@ -193,13 +201,45 @@ function shortUA() {
 }
 
 let toastTimer;
-function toast(msg, isError) {
+/**
+ * トーストの置き場所を合わせる。モーダルのダイアログが開いている間は、ダイアログの外の要素は押せなくなる(inert)ので、
+ * ダイアログの中に移す。閉じたら body に戻す
+ */
+function placeToast() {
   const el = $('toast');
-  el.textContent = msg;
+  const parent = dlg.open ? dlg : document.body;
+  if (el.parentNode !== parent) parent.append(el);
+}
+/** ダイアログの中身を差し替える。中に移したトーストは消さずに残す */
+function setDialog(...nodes) {
+  const el = $('toast');
+  const keep = el.parentNode === dlg;
+  dlg.replaceChildren(...nodes);
+  if (keep) dlg.append(el);
+}
+
+/**
+ * 画面下に短い知らせを出す。action({label, run}) を渡すと「元に戻す」などのボタンを付ける。
+ * 対応ブラウザでは popover として最前面に出す(ダイアログの暗い背景に隠れないように)。
+ */
+function toast(msg, isError, action) {
+  const el = $('toast');
+  placeToast();
+  const top = typeof el.showPopover === 'function';
+  const hide = () => { if (top) { if (el.matches(':popover-open')) el.hidePopover(); } else el.hidden = true; };
+  // replaceChildren は null を「null」という文字にするので、h() でまとめて null を落とす
+  el.replaceChildren(...h('div', null, h('span', null, msg), action ? h('button', {
+    type: 'button', class: 'toast-action',
+    onclick: guard(async () => { hide(); await action.run(); }),
+  }, action.label) : null).childNodes);
   el.className = 'toast' + (isError ? ' error' : '');
-  el.hidden = false;
+  if (top) {
+    el.hidden = false;
+    hide(); // 開き直して、後から開いたダイアログよりも前に出す
+    el.showPopover();
+  } else el.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { el.hidden = true; }, isError ? 7000 : 2500);
+  toastTimer = setTimeout(hide, isError ? 7000 : action ? 6000 : 2500);
 }
 function fail(e) {
   console.error(e);
@@ -604,13 +644,19 @@ function showValue(field, v) {
   return v === '' || v == null ? '(なし)' : String(v);
 }
 
-async function setField(id, field, value) {
+/**
+ * 1項目を変更する。undo を true にすると、変更後に「元に戻す」付きのトーストを出す
+ * (ドラッグで別の列に落とした・選択を誤った、を1操作で戻せるように)
+ */
+async function setField(id, field, value, { undo = false } = {}) {
   const cur = state.tickets.get(id);
   if (!cur) throw new Error(notFoundMsg('チケット'));
   if (JSON.stringify(cur[field] ?? '') === JSON.stringify(value)) return;
+  let prev;
   const entry = { at: nowIso(), by: state.me.id, field };
   const t = await updateTicket(id, (x) => {
     if (field !== 'description') { entry.from = showValue(field, x[field]); entry.to = showValue(field, value); }
+    prev = structuredClone(x[field] ?? '');
     x[field] = value;
     x.history.push(entry);
   });
@@ -618,6 +664,33 @@ async function setField(id, field, value) {
   log('ticket.update', t.key, field === 'description' ? `${label}を編集` : `${label}: ${entry.from} → ${entry.to}`);
   renderMain();
   refreshHistory();
+  if (undo) {
+    toast(`${t.key} の${label}を「${entry.to}」にしました`, false, {
+      label: '元に戻す',
+      run: async () => {
+        const same = (a, b) => JSON.stringify(a ?? '') === JSON.stringify(b ?? '');
+        const back = { at: nowIso(), by: state.me.id, field, from: entry.to, to: entry.from };
+        let changedByOther = false;
+        try {
+          // 保存直前に読み直して、他の人がその後に変えていたら戻さない(mutator の例外で書き込みを止める)
+          await updateTicket(id, (x) => {
+            if (!same(x[field], value)) { changedByOther = true; throw new Error('changed'); }
+            x[field] = prev;
+            x.history.push(back);
+          });
+        } catch (e) {
+          if (!changedByOther) throw e;
+          toast(`${t.key} の${label}は、その後に他の人が変更したため戻しませんでした`, true);
+          return;
+        }
+        log('ticket.update', t.key, `${label}: ${entry.to} → ${entry.from}(元に戻す)`);
+        renderMain();
+        refreshHistory();
+        if (state.openId) renderTicketDialog();
+        toast(`${t.key} の${label}を「${entry.from}」に戻しました`);
+      },
+    });
+  }
 }
 
 /* ================= チケット番号の重複対策 ================= */
@@ -1108,18 +1181,67 @@ function renderFilters() {
   const users = [...state.users.values()].sort((a, b) => String(a.name).localeCompare(String(b.name), 'ja'));
   const projects = state.config.projects;
   bar.replaceChildren(...[
-    h('input', { type: 'search', placeholder: 'キー・タイトル・説明・ラベルで検索', value: f.q, oninput: on('q') }),
+    h('input', { type: 'search', placeholder: 'キー・タイトル・説明・ラベル・コメントで検索', value: f.q, oninput: on('q') }),
     // プロジェクトが1つもなければ出さない(記憶していた値が残っていても、select() が選択肢に残すので戻せる)
     projects.length || f.project ? select([['', 'プロジェクト: すべて'], ['__none', 'プロジェクトなし'], ...projects], f.project, on('project')) : null,
     select([['', '担当者: すべて'], ['__none', '未割り当て'], ...users.map((u) => [u.id, u.name || u.id])], f.assignee, on('assignee')),
     select([['', '種別: すべて'], ...state.config.types], f.type, on('type')),
     select([['', '優先度: すべて'], ...state.config.priorities], f.priority, on('priority')),
+    // 選択肢はチケットに付いているラベルから作るので、renderMain のたびに syncFilterBar() で作り直す
+    h('select', { id: 'labelFilter', title: 'ラベルで絞り込み', onchange: on('label') }),
     h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: f.mine, onchange: on('mine', 'checked') }), '自分の担当のみ'),
     h('label', { class: 'check', title: '自分に関係するチケットのうち、他の人が更新して未読のもの' },
       h('input', { type: 'checkbox', checked: f.unread, onchange: on('unread', 'checked') }), '新着のみ'),
     h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: f.archived, onchange: on('archived', 'checked') }), 'アーカイブを表示'),
+    h('span', { class: 'filter-state', id: 'filterState' }),
     h('span', { class: 'count', id: 'count' }),
   ].filter(Boolean));
+  syncFilterBar();
+}
+
+const FILTER_DEFAULTS = () => ({ q: '', project: '', assignee: '', type: '', priority: '', label: '', mine: false, unread: false, archived: false });
+/** 既定と違う絞り込みがあるか(記憶された絞り込みで「チケットが消えた」と見えないよう、表示して知らせる) */
+const isFiltering = () => Object.entries(FILTER_DEFAULTS()).some(([k, v]) => (k === 'q' ? state.filters.q.trim() : state.filters[k]) !== v);
+
+function clearFilters() {
+  state.filters = FILTER_DEFAULTS();
+  renderFilters();
+  renderMain();
+}
+
+/** 「UI, 緊急」のような入力をラベルの配列にする(全角の読点も区切りにする) */
+const parseLabels = (v) => [...new Set(String(v).split(/[,、]/).map((x) => x.trim()).filter(Boolean))];
+
+/** すべてのチケットに付いているラベル(多い順 → 名前順) */
+function allLabels() {
+  const n = new Map();
+  for (const t of state.tickets.values()) for (const l of t.labels) n.set(l, (n.get(l) || 0) + 1);
+  return [...n].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'ja')).map(([l]) => l);
+}
+
+/** 絞り込みバーのうち、チケットの中身で変わる部分(ラベルの選択肢・絞り込み中の表示)を描き直す。入力中の検索欄は触らない */
+function syncFilterBar() {
+  const bar = $('filters');
+  if (!bar || bar.hidden) return;
+  const f = state.filters;
+  const sel = $('labelFilter');
+  if (sel) {
+    const labels = allLabels();
+    if (f.label && !labels.includes(f.label)) labels.push(f.label);
+    const sig = JSON.stringify(labels);
+    if (sel.dataset.sig !== sig) {
+      sel.dataset.sig = sig;
+      sel.replaceChildren(h('option', { value: '' }, 'ラベル: すべて'), ...labels.map((l) => h('option', { value: l }, l)));
+    }
+    sel.value = f.label;
+    sel.hidden = !labels.length;
+  }
+  const st = $('filterState');
+  if (st) {
+    st.replaceChildren(...(isFiltering()
+      ? [h('span', { class: 'note' }, '絞り込み中'), h('button', { type: 'button', class: 'btn small', title: '検索と絞り込みをすべて解除', onclick: clearFilters }, '✕ クリア')]
+      : []));
+  }
 }
 
 function visibleTickets() {
@@ -1134,7 +1256,8 @@ function visibleTickets() {
     if (f.assignee === '__none' ? !!t.assignee : f.assignee && t.assignee !== f.assignee) return false;
     if (f.type && t.type !== f.type) return false;
     if (f.priority && t.priority !== f.priority) return false;
-    if (q && ![t.key, t.title, t.description, t.labels.join(' ')].join('\n').toLowerCase().includes(q)) return false;
+    if (f.label && !t.labels.includes(f.label)) return false;
+    if (q && ![t.key, t.title, t.description, t.labels.join(' '), ...t.comments.map((c) => String(c && c.body || ''))].join('\n').toLowerCase().includes(q)) return false;
     return true;
   });
 }
@@ -1145,6 +1268,10 @@ const projectChip = (t) => (t.project ? h('span', { class: 'chip project', title
 const prioIndex = (p) => { const i = state.config.priorities.indexOf(p); return i < 0 ? 99 : i; };
 const isDone = (t) => t.status === state.config.statuses[state.config.statuses.length - 1];
 const isOverdue = (t) => !!t.due && t.due < todayStr() && !isDone(t);
+/** 期限が今日から3日以内(過ぎたものは isOverdue) */
+const isDueSoon = (t) => !!t.due && t.due >= todayStr() && t.due <= todayStr(3) && !isDone(t);
+const dueClass = (t) => 'due' + (isOverdue(t) ? ' over' : isDueSoon(t) ? ' soon' : '');
+const dueTitle = (t) => (isOverdue(t) ? '期限切れ' : isDueSoon(t) ? '期限が近い(3日以内)' : '期限');
 const prioChip = (p) => (p ? h('span', { class: `chip p${prioIndex(p)}` }, p) : null);
 
 /** 表示・絞り込み・並べ替えをこのブラウザに保存する(共有フォルダには書かない) */
@@ -1188,6 +1315,7 @@ function renderMain() {
   const views = { board: viewBoard, list: viewList, activity: viewActivity, members: viewMembers, settings: viewSettings };
   main.replaceChildren(views[state.view]());
   main.scrollTop = top;
+  syncFilterBar();
   renderUnread();
 }
 
@@ -1212,7 +1340,7 @@ function viewBoard() {
       e.preventDefault();
       col.classList.remove('drop');
       const id = e.dataTransfer.getData('text/ticket-id');
-      if (id) await setField(id, 'status', status);
+      if (id) await setField(id, 'status', status, { undo: true });
     }));
     return col;
   }));
@@ -1223,9 +1351,12 @@ const unreadDot = (t) => (isUnread(t) ? h('span', { class: 'unread-dot', title: 
 
 function card(t) {
   const unread = hasUnread(t);
-  const el = h('div', { class: 'card' + (unread ? ' unread' : ''), draggable: true, onclick: () => openTicket(t.id) },
+  const el = h('div', { class: 'card' + (unread ? ' unread' : '') + (state.cursor === t.id ? ' cursor' : ''), draggable: true, onclick: () => openTicket(t.id) },
     h('div', { class: 'title' }, unreadDot(t), t.title),
-    t.labels.length ? h('div', { class: 'labels' }, t.labels.map((l) => h('span', { class: 'chip' }, l))) : null,
+    t.labels.length ? h('div', { class: 'labels' }, t.labels.map((l) => h('button', {
+      type: 'button', class: 'chip label', title: `ラベル「${l}」で絞り込む`,
+      onclick: (e) => { e.stopPropagation(); state.filters.label = l; renderMain(); },
+    }, l))) : null,
     h('div', { class: 'meta' },
       h('span', { class: 'key' }, t.key),
       projectChip(t),
@@ -1234,8 +1365,9 @@ function card(t) {
       progressBadges(t),
       h('span', { class: 'spacer' }),
       t.comments.length ? h('span', { title: 'コメント数' }, `💬${t.comments.length}`) : null,
-      t.due ? h('span', { class: 'due' + (isOverdue(t) ? ' over' : ''), title: '期限' }, t.due.slice(5).replace('-', '/')) : null,
+      t.due ? h('span', { class: dueClass(t), title: `${dueTitle(t)}: ${t.due}` }, t.due.slice(5).replace('-', '/')) : null,
       avatar(t.assignee)));
+  el.dataset.id = t.id;
   el.addEventListener('dragstart', (e) => { e.dataTransfer.setData('text/ticket-id', t.id); el.classList.add('dragging'); });
   el.addEventListener('dragend', () => el.classList.remove('dragging'));
   return el;
@@ -1272,7 +1404,7 @@ function viewList() {
   if (!tickets.length) return h('div', { class: 'table-wrap' }, h('div', { class: 'empty' }, '該当するチケットはありません'));
   return h('div', { class: 'table-wrap' }, h('table', null,
     h('thead', null, h('tr', null, cols.map(th))),
-    h('tbody', null, tickets.map((t) => h('tr', { class: 'clickable', onclick: () => openTicket(t.id) },
+    h('tbody', null, tickets.map((t) => h('tr', { class: 'clickable' + (state.cursor === t.id ? ' cursor' : ''), 'data-id': t.id, onclick: () => openTicket(t.id) },
       h('td', { class: 'nowrap' }, h('span', { class: 'key' }, t.key)),
       h('td', { class: 'wrap' }, unreadDot(t), t.title, ' ', progressBadges(t)),
       showProject ? h('td', { class: 'nowrap' }, t.project) : null,
@@ -1280,7 +1412,7 @@ function viewList() {
       h('td', { class: 'nowrap' }, t.status),
       h('td', { class: 'nowrap' }, prioChip(t.priority)),
       h('td', { class: 'nowrap' }, nameOf(t.assignee)),
-      h('td', { class: 'nowrap' }, h('span', { class: 'due' + (isOverdue(t) ? ' over' : '') }, t.due || '')),
+      h('td', { class: 'nowrap' }, h('span', { class: dueClass(t), title: t.due ? dueTitle(t) : null }, t.due || '')),
       h('td', { class: 'nowrap' }, fmtDateTime(t.updatedAt)))))));
 }
 
@@ -1308,7 +1440,8 @@ function viewActivity() {
         h('td', { class: 'nowrap', title: `ID: ${logUser(r)}` }, r.name || logUser(r)),
         h('td', { class: 'nowrap', title: `端末ID: ${r.deviceId || ''}` }, [r.device, r.ua].filter(Boolean).join(' / ')),
         h('td', { class: 'nowrap' }, ACTION_LABELS[r.action] || r.action),
-        h('td', { class: 'nowrap' }, r.ticket),
+        // ログにはキーしか残らないので、今そのキーを持つチケットを開く(振り直し後は別のチケットのことがある)
+        h('td', { class: 'nowrap' }, (() => { const t = r.ticket && findByKey(String(r.ticket)); return t ? keyLink(t, String(r.ticket)) : r.ticket; })()),
         h('td', { class: 'wrap' }, r.detail))))));
     if (rows.length > shown.length) body.append(h('div', { class: 'empty' }, `${rows.length} 件中、新しい ${shown.length} 件を表示しています`));
   })();
@@ -1522,6 +1655,14 @@ function takeOverPanel() {
     h('div', { class: 'row' }, input, h('button', { class: 'btn', onclick: apply }, '引き継ぐ')));
 }
 
+/** 担当者の選択肢。自分を先頭に、残りは名前順 */
+function assigneeOptions() {
+  const me = state.me.id;
+  const users = [...state.users.values()]
+    .sort((a, b) => (b.id === me) - (a.id === me) || String(a.name || a.id).localeCompare(String(b.name || b.id), 'ja'));
+  return [['', '未割り当て'], ...users.map((u) => [u.id, u.name || u.id])];
+}
+
 /* ================= ダイアログ: チケット作成 ================= */
 
 function openCreateDialog() {
@@ -1529,20 +1670,43 @@ function openCreateDialog() {
   const title = h('input', { type: 'text', required: true, maxLength: 200, placeholder: '何をしますか?' });
   const type = select(c.types, c.types[0]);
   const prio = select(c.priorities, c.priorities[Math.min(1, c.priorities.length - 1)]);
-  const users = [...state.users.values()];
-  const assignee = select([['', '未割り当て'], ...users.map((u) => [u.id, u.name || u.id])], '');
+  const assignee = select(assigneeOptions(), '');
   // 絞り込み中のプロジェクトがあれば、それを初期値にする(作った直後に一覧から消えないように)
   const pf = state.filters.project;
   const project = select([['', '(なし)'], ...c.projects], pf && pf !== '__none' ? pf : '');
   state.openId = null;
   dlg.className = 'dlg narrow';
-  dlg.replaceChildren(h('form', {
+  const create = async (text) => {
+    const t = await createTicket({ title: text, type: type.value, priority: prio.value, assignee: assignee.value, project: project.value });
+    renderMain();
+    return t;
+  };
+  const takeTitle = () => {
+    const text = title.value.trim();
+    if (!text) { toast('タイトルを入力してください', true); title.focus(); }
+    return text;
+  };
+  // 続けて何件も登録するとき用。詳細を開かず、種別・担当者などはそのまま残してタイトルだけ空にする。
+  // 押した時点でタイトルを取り出して空にするので、素早く2回押しても同じチケットが2枚できない
+  const createAndContinue = guard(async () => {
+    const text = takeTitle();
+    if (!text) return;
+    title.value = '';
+    title.focus();
+    try {
+      const t = await create(text);
+      toast(`${t.key}「${t.title}」を作成しました`);
+    } catch (e) {
+      if (!title.value) title.value = text; // 失敗したら入力を戻す
+      throw e;
+    }
+  });
+  setDialog(h('form', {
     onsubmit: guard(async (e) => {
       e.preventDefault();
-      if (!title.value.trim()) { toast('タイトルを入力してください', true); title.focus(); return; }
-      const t = await createTicket({ title: title.value.trim(), type: type.value, priority: prio.value, assignee: assignee.value, project: project.value });
-      renderMain();
-      openTicket(t.id);
+      const text = takeTitle();
+      if (!text) return;
+      openTicket((await create(text)).id);
     }),
   },
     h('div', { class: 'dlg-head' }, h('strong', null, 'チケット作成'), h('span', { class: 'spacer' }),
@@ -1554,7 +1718,9 @@ function openCreateDialog() {
         h('div', null, h('label', null, '優先度'), prio)),
       h('label', null, '担当者'), assignee,
       c.projects.length || project.value ? [h('label', null, 'プロジェクト'), project] : null,
-      h('div', { class: 'toolbar' }, h('button', { class: 'btn primary', type: 'submit' }, '作成')))));
+      h('div', { class: 'toolbar' },
+        h('button', { class: 'btn primary', type: 'submit' }, '作成'),
+        h('button', { class: 'btn', type: 'button', title: '作成して、続けて次のチケットを入力する', onclick: createAndContinue }, '作成して続ける')))));
   if (!dlg.open) dlg.showModal();
   title.focus();
 }
@@ -1589,6 +1755,28 @@ function renderTicketDialog() {
     ? Object.fromEntries([...dlg.querySelectorAll('[data-draft]')].map((el) => [el.dataset.draft, el.value]))
     : {};
   const c = state.config;
+  // 開いているチケットが変わったら、セクションの開閉・編集中の状態を戻す
+  if (state.detail.id !== t.id) state.detail = { id: t.id, open: new Set(), descEditing: false, editComment: null };
+  const D = state.detail;
+  /*
+   * 中身が0件のセクションは見出しと「＋ 追加」だけにして、ダイアログを短くする。
+   * 押すと入力欄を出す(描き直さないので、他の欄の書きかけは消えない)。書きかけがあれば最初から開く。
+   */
+  const section = (name, label, count, list, addRow, draftKeys = []) => {
+    const open = count > 0 || D.open.has(name) || draftKeys.some((k) => drafts[k]);
+    const body = h('div', { class: 'section-body', hidden: !open }, list, addRow);
+    const btn = open ? null : h('button', {
+      type: 'button', class: 'btn small',
+      onclick: () => {
+        D.open.add(name);
+        body.hidden = false;
+        btn.remove();
+        const input = addRow.querySelector('input:not([type=file])');
+        if (input) input.focus();
+      },
+    }, '＋ 追加');
+    return h('div', { class: 'section', 'data-section': name }, h('div', { class: 'section-title' }, label, btn), body);
+  };
   const oldMain = dlg.querySelector('.ticket-main');
   const scroll = [dlg.scrollTop, oldMain ? oldMain.scrollTop : 0];
   const change = (field, conv = (v) => v) => guard((e) => setField(t.id, field, conv(e.target.value)));
@@ -1655,6 +1843,60 @@ function renderTicketDialog() {
     rerender();
   });
   commentBox.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) addComment(); });
+  // 自分のコメントだけ直せる。id で当てるので、他の人が同時に足したコメントは消さない
+  const commentGone = () => new Error('コメントが見つかりません。他の端末で削除された可能性があります');
+  const saveCommentEdit = (cm, box) => guard(async () => {
+    const body = box.value.trim();
+    if (!body) { toast('コメントが空です。消すときは「削除」を押してください', true); box.focus(); return; }
+    await updateTicket(t.id, (x) => {
+      const it = x.comments.find((y) => y && y.id === cm.id);
+      if (!it) throw commentGone();
+      it.body = body;
+      it.editedAt = nowIso();
+      x.history.push({ at: it.editedAt, by: state.me.id, field: 'コメント', from: '', to: `編集: ${body.slice(0, 40)}` });
+    });
+    log('comment.edit', t.key, body.slice(0, 80));
+    D.editComment = null;
+    box.value = '';
+    rerender();
+  });
+  const deleteComment = (cm) => guard(async () => {
+    if (!confirm('このコメントを削除しますか?')) return;
+    const head = String(cm.body ?? '').slice(0, 40);
+    await updateTicket(t.id, (x) => {
+      if (!x.comments.some((y) => y && y.id === cm.id)) throw commentGone();
+      x.comments = x.comments.filter((y) => !(y && y.id === cm.id));
+      x.history.push({ at: nowIso(), by: state.me.id, field: 'コメント', from: '', to: `削除: ${head}` });
+    });
+    log('comment.remove', t.key, head);
+    if (D.editComment === cm.id) D.editComment = null;
+    rerender();
+  });
+  const commentView = (cm) => {
+    const mine = !!(cm && cm.id && cm.by === state.me.id);
+    const editing = mine && D.editComment === cm.id;
+    const box = editing ? h('textarea', { rows: 3, value: String(cm.body ?? ''), 'data-draft': `cedit-${cm.id}` }) : null;
+    if (box) {
+      box.addEventListener('keydown', (e) => {
+        if (e.isComposing) return; // 変換中の Esc・Enter は変換の操作
+        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) saveCommentEdit(cm, box)();
+        // Esc はダイアログを閉じずに編集だけやめる
+        if (e.key === 'Escape') { e.preventDefault(); D.editComment = null; box.value = ''; rerender(); }
+      });
+    }
+    return h('div', { class: 'comment' }, avatar(cm.by),
+      h('div', { class: 'body' },
+        h('span', { class: 'who' }, nameOf(cm.by)), h('span', { class: 'when' }, fmtDateTime(cm.at)),
+        cm.editedAt ? h('span', { class: 'when', title: `編集: ${fmtDateTime(cm.editedAt)}` }, '(編集済み)') : null,
+        mine && !editing ? h('span', { class: 'comment-actions' },
+          h('button', { type: 'button', class: 'btn small ghost', disabled: !!D.editComment, title: D.editComment ? '編集中のコメントを保存かキャンセルしてから押してください' : null, onclick: () => { D.editComment = cm.id; rerender(); const b = dlg.querySelector(`[data-draft="cedit-${cm.id}"]`); if (b) b.focus(); } }, '編集'),
+          h('button', { type: 'button', class: 'btn small ghost danger', onclick: deleteComment(cm) }, '削除')) : null,
+        editing
+          ? [box, h('div', { class: 'toolbar' },
+            h('button', { type: 'button', class: 'btn primary small', onclick: saveCommentEdit(cm, box) }, '保存'),
+            h('button', { type: 'button', class: 'btn small', onclick: () => { D.editComment = null; box.value = ''; rerender(); } }, 'キャンセル'))]
+          : h('div', { class: 'pre' }, linkify(cm.body))));
+  };
 
   /* --- チェックリスト --- */
   const clInput = h('input', { type: 'text', placeholder: '項目を追加(Enter で追加)', maxLength: 200, 'data-draft': 'check' });
@@ -1730,14 +1972,95 @@ function renderTicketDialog() {
   relInput.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); addRel(); } });
 
   historyBox = h('ul', { class: 'history' });
-  const users = [...state.users.values()];
+
+  /* --- 説明: ふだんはリンク付きで表示し、押すと編集。欄の外を押す・Ctrl+Enter・Esc で保存 --- */
+  const descBox = h('div', { class: 'desc' });
+  const descView = (desc) => [
+    h('div', {
+      class: 'desc-view pre' + (desc ? '' : ' empty'), tabIndex: 0, title: 'クリックで編集 (E)',
+      onclick: (e) => { if (!e.target.closest('a, button')) startDescEdit(); },
+      onkeydown: (e) => { if (e.key === 'Enter' && e.target === e.currentTarget) { e.preventDefault(); startDescEdit(); } },
+    }, desc ? linkify(desc) : '説明を追加…(クリックで編集)'),
+    (() => {
+      const refs = referencedTickets(desc, t.id);
+      const missing = missingKeys(desc);
+      return refs.length || missing.length ? h('div', { class: 'refs' },
+        refs.length ? [h('span', { class: 'note' }, '参照:'), refs.map((r) => keyLink(r, `${r.key} ${r.title}`))] : null,
+        missing.length ? h('span', { class: 'warn', title: 'このキーのチケットはありません。キーの書き間違いか、削除された可能性があります' }, `⚠ 見つからないキー: ${missing.join(', ')}`) : null) : null;
+    })(),
+  ];
+  // 保存後はダイアログ全体を描き直さず、この欄だけ差し替える(閉じるボタンなどを押した瞬間に要素が消えないように)
+  const descEditor = () => {
+    // data-draft があるので、編集中にダイアログが描き直されても書きかけは引き継がれる
+    const ta = h('textarea', { class: 'desc-edit', rows: 8, value: (state.tickets.get(t.id) || t).description, placeholder: `説明を入力。${c.key}-12 のようにキーを書くとリンクになります`, 'data-draft': 'desc' });
+    let saving = false;
+    const finish = guard(async () => {
+      if (saving) return;
+      saving = true;
+      const v = ta.value;
+      try {
+        if (v !== (state.tickets.get(t.id) || t).description) {
+          await setField(t.id, 'description', v);
+          toast('説明を保存しました');
+        }
+      } catch (e) {
+        // 保存できなかったら編集欄を残す(書きかけを消さない)
+        saving = false;
+        throw e;
+      }
+      D.descEditing = false;
+      if (descBox.isConnected) descBox.replaceChildren(...descView((state.tickets.get(t.id) || t).description));
+    });
+    // 別のウィンドウに切り替えただけ(ページ自体がフォーカスを失った)のときは保存しない
+    ta.addEventListener('blur', () => { if (document.hasFocus() || !dlg.open) finish(); });
+    ta.addEventListener('keydown', (e) => {
+      if (e.isComposing) return; // 変換中の Esc は変換の取り消し
+      if (e.key === 'Escape' || (e.key === 'Enter' && (e.ctrlKey || e.metaKey))) { e.preventDefault(); finish(); }
+    });
+    return [ta, h('div', { class: 'note' }, '欄の外を押す・Ctrl+Enter・Esc で保存します')];
+  };
+  const startDescEdit = () => {
+    D.descEditing = true;
+    descBox.replaceChildren(...descEditor());
+    const ta = descBox.querySelector('textarea');
+    ta.focus();
+    ta.setSelectionRange(ta.value.length, ta.value.length);
+  };
+  descBox.replaceChildren(...(D.descEditing ? descEditor() : descView(t.description)));
+
+  /* --- ラベル: 他のチケットで使っているラベルを候補に出し、押すと足す --- */
+  const labelInput = h('input', {
+    type: 'text', value: t.labels.join(', '),
+    onchange: change('labels', (v) => parseLabels(v)),
+  });
+  const labelSuggest = allLabels().filter((l) => !t.labels.includes(l)).slice(0, 8);
+  const addLabel = (l) => guard(async () => {
+    // 入力欄を書き換えていればその内容に、そうでなければ保存直前に読み直したラベルに足す(他の人が足した分を消さない)
+    const typed = parseLabels(labelInput.value);
+    const edited = typed.join(', ') !== t.labels.join(', ');
+    const entry = { at: nowIso(), by: state.me.id, field: 'labels' };
+    const saved = await updateTicket(t.id, (x) => {
+      const next = [...new Set([...(edited ? typed : x.labels), l])];
+      entry.from = showValue('labels', x.labels);
+      entry.to = showValue('labels', next);
+      x.labels = next;
+      x.history.push(entry);
+    });
+    log('ticket.update', saved.key, `${FIELD_LABELS.labels}: ${entry.from} → ${entry.to}`);
+    renderMain();
+    renderTicketDialog();
+  });
 
   dlg.className = 'dlg';
-  dlg.replaceChildren(
+  setDialog(
     h('div', { class: 'dlg-head' },
       parentTicket ? h('span', { class: 'parent-link' }, keyLink(parentTicket, `${parentTicket.key} ${parentTicket.title}`), ' ›')
         : t.parent ? h('span', { class: 'warn', title: '親チケットのファイルがありません。関連チケット欄から親を外すか、付け直してください' }, '⚠ 親チケットが見つかりません') : null,
       h('span', { class: 'key' }, t.key),
+      h('button', {
+        type: 'button', class: 'btn small ghost', title: 'キーとタイトルをコピー(チャットなどに貼る用)',
+        onclick: guard(async () => { await navigator.clipboard.writeText(`${t.key} ${t.title}`); toast(`「${t.key} ${t.title}」をコピーしました`); }),
+      }, 'コピー'),
       t.archived ? h('span', { class: 'chip' }, 'アーカイブ済み') : null,
       h('span', { class: 'spacer' }),
       h('button', {
@@ -1760,33 +2083,26 @@ function renderTicketDialog() {
           }),
         }),
         h('div', { class: 'section-title' }, '説明'),
-        h('textarea', { rows: 6, value: t.description, placeholder: `説明を入力(フォーカスを外すと保存されます)。${c.key}-12 のようにキーを書くとリンクになります`, onchange: change('description') }),
-        (() => {
-          const refs = referencedTickets(t.description, t.id);
-          const missing = missingKeys(t.description);
-          return refs.length || missing.length ? h('div', { class: 'refs' },
-            refs.length ? [h('span', { class: 'note' }, '参照:'), refs.map((r) => keyLink(r, `${r.key} ${r.title}`))] : null,
-            missing.length ? h('span', { class: 'warn', title: 'このキーのチケットはありません。キーの書き間違いか、削除された可能性があります' }, `⚠ 見つからないキー: ${missing.join(', ')}`) : null) : null;
-        })(),
+        descBox,
 
-        h('div', { class: 'section-title' }, `チェックリスト${t.checklist.length ? ` (${checkDone}/${t.checklist.length})` : ''}`),
-        h('ul', { class: 'checklist' }, t.checklist.map((item) => h('li', { class: item.done ? 'done' : '' },
-          h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: !!item.done, onchange: toggleCheck(item) }), h('span', null, String(item.text ?? ''))),
-          h('button', { class: 'btn small danger', title: '削除', onclick: removeCheck(item) }, '削除')))),
-        h('div', { class: 'row checklist-add' }, clInput, h('button', { class: 'btn', onclick: addCheck }, '追加')),
+        section('checklist', `チェックリスト${t.checklist.length ? ` (${checkDone}/${t.checklist.length})` : ''}`, t.checklist.length,
+          h('ul', { class: 'checklist' }, t.checklist.map((item) => h('li', { class: item.done ? 'done' : '' },
+            h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: !!item.done, onchange: toggleCheck(item) }), h('span', null, String(item.text ?? ''))),
+            h('button', { class: 'btn small danger', title: '削除', onclick: removeCheck(item) }, '削除')))),
+          h('div', { class: 'row checklist-add' }, clInput, h('button', { class: 'btn', onclick: addCheck }, '追加')), ['check']),
 
-        h('div', { class: 'section-title' }, `サブチケット${subActive.length ? ` (${subDone}/${subActive.length})` : ''}`),
+        section('sub', `サブチケット${subActive.length ? ` (${subDone}/${subActive.length})` : ''}`, subs.length,
         h('ul', { class: 'link-list sub-list' }, subs.map((x) => h('li', { class: x.archived ? 'archived' : '' },
           unreadDot(x),
           h('span', { class: 'name' }, keyLink(x), ' ', x.title, x.archived ? h('span', { class: 'note' }, ' (アーカイブ済み)') : null),
           h('span', { class: 'note nowrap' }, nameOf(x.assignee)),
           select(c.statuses, x.status, async (e) => {
-            try { await setField(x.id, 'status', e.target.value); } catch (err) { fail(err); }
+            try { await setField(x.id, 'status', e.target.value, { undo: true }); } catch (err) { fail(err); }
             renderTicketDialog(); // 失敗したときも、保存されている値に戻す
           }, { title: 'ステータス' })))),
-        h('div', { class: 'row sub-add' }, subInput, h('button', { class: 'btn', onclick: addSub }, '追加')),
+        h('div', { class: 'row sub-add' }, subInput, h('button', { class: 'btn', onclick: addSub }, '追加')), ['sub']),
 
-        h('div', { class: 'section-title' }, '関連チケット'),
+        section('rel', '関連チケット', rels.length,
         h('ul', { class: 'link-list rel-list' }, rels.map((x) => h('li', null,
           h('span', { class: 'chip' }, relKindLabel(x.kind)),
           x.other
@@ -1804,13 +2120,13 @@ function renderTicketDialog() {
               rerender();
             }),
           }, '削除')))),
-        h('div', { class: 'row' }, relKind, relInput, candidates, h('button', { class: 'btn', onclick: addRel }, '追加')),
+        h('div', { class: 'row rel-add' }, relKind, relInput, candidates, h('button', { class: 'btn', onclick: addRel }, '追加')), ['rel']),
 
         h('div', { class: 'section-title' }, '添付ファイル', h('span', { class: 'spacer' }),
           h('button', { class: 'btn small', onclick: () => picker.click() }, '＋ ファイルを追加'), picker),
         zone,
 
-        h('div', { class: 'section-title' }, '関連リンク(Box 共有リンクなど)'),
+        section('link', '関連リンク(Box 共有リンクなど)', links.length,
         h('ul', { class: 'link-list' }, links.map((l) => h('li', null,
           h('a', { class: 'name', href: l.url, target: '_blank', rel: 'noopener noreferrer', title: l.url }, l.title || l.url),
           h('button', {
@@ -1824,30 +2140,31 @@ function renderTicketDialog() {
               rerender();
             }),
           }, '削除')))),
-        h('div', { class: 'row' }, linkTitle, linkUrl, h('button', { class: 'btn', onclick: addLink }, '追加')),
+        h('div', { class: 'row link-add' }, linkTitle, linkUrl, h('button', { class: 'btn', onclick: addLink }, '追加')), ['linkTitle', 'linkUrl']),
 
         h('div', { class: 'section-title' }, `コメント (${t.comments.length})`),
-        t.comments.map((cm) => h('div', { class: 'comment' }, avatar(cm.by),
-          h('div', { class: 'body' },
-            h('span', { class: 'who' }, nameOf(cm.by)), h('span', { class: 'when' }, fmtDateTime(cm.at)),
-            h('div', { class: 'pre' }, linkify(cm.body))))),
+        t.comments.filter((cm) => cm && typeof cm === 'object').map(commentView),
         commentBox,
         h('div', { class: 'toolbar' }, h('button', { class: 'btn primary', onclick: addComment }, 'コメントする')),
 
         h('details', null, h('summary', { class: 'section-title' }, '変更履歴'), historyBox)),
 
       h('div', { class: 'ticket-side' },
-        h('label', null, 'ステータス'), select(c.statuses, t.status, change('status')),
-        h('label', null, '担当者'), select([['', '未割り当て'], ...users.map((u) => [u.id, u.name || u.id])], t.assignee || '', change('assignee')),
+        h('label', null, 'ステータス'), select(c.statuses, t.status, guard((e) => setField(t.id, 'status', e.target.value, { undo: true }))),
+        h('label', null, '担当者'), select(assigneeOptions(), t.assignee || '', change('assignee')),
+        t.assignee !== state.me.id ? h('button', {
+          type: 'button', class: 'btn small assign-me',
+          onclick: guard(async () => { await setField(t.id, 'assignee', state.me.id); renderTicketDialog(); }),
+        }, '自分に割り当て') : null,
         h('label', null, '種別'), select(c.types, t.type, change('type')),
         h('label', null, '優先度'), select(c.priorities, t.priority, change('priority')),
         h('label', null, '期限'), h('input', { type: 'date', value: t.due || '', onchange: change('due') }),
         c.projects.length || t.project ? [h('label', null, 'プロジェクト'), select([['', '(なし)'], ...c.projects], t.project, change('project'))] : null,
         h('label', null, 'ラベル(カンマ区切り)'),
-        h('input', {
-          type: 'text', value: t.labels.join(', '),
-          onchange: change('labels', (v) => [...new Set(v.split(/[,、]/).map((s) => s.trim()).filter(Boolean))]),
-        }),
+        labelInput,
+        labelSuggest.length ? h('div', { class: 'label-suggest' }, h('span', { class: 'note' }, '候補:'),
+          // mousedown で入力欄のフォーカスを外さない(外すと書きかけの内容が先に保存され、二重に書き込むため)
+          labelSuggest.map((l) => h('button', { type: 'button', class: 'chip label', title: `「${l}」を追加`, onmousedown: (e) => e.preventDefault(), onclick: addLabel(l) }, `＋${l}`))) : null,
         h('div', { class: 'side-meta' },
           h('div', null, `報告者: ${nameOf(t.reporter)}`),
           h('div', null, `作成: ${fmtDateTime(t.createdAt)}`),
@@ -1862,8 +2179,14 @@ function renderTicketDialog() {
   if (newMain) newMain.scrollTop = scroll[1];
 }
 
-dlg.addEventListener('close', () => { state.openId = null; dlg.dataset.ticket = ''; });
-dlg.addEventListener('mousedown', (e) => { if (e.target === dlg) dlg.close(); });
+dlg.addEventListener('close', () => { placeToast(); state.openId = null; dlg.dataset.ticket = ''; state.detail = { id: null, open: new Set(), descEditing: false, editComment: null }; });
+/** ダイアログを閉じる前に、編集中の説明を blur させて保存を走らせる(ブラウザによっては閉じても blur が起きないため) */
+function flushDialogEdits() {
+  const a = document.activeElement;
+  if (a && dlg.contains(a) && a.classList.contains('desc-edit')) a.blur();
+}
+dlg.addEventListener('cancel', flushDialogEdits);
+dlg.addEventListener('mousedown', (e) => { if (e.target === dlg) { flushDialogEdits(); dlg.close(); } });
 
 /* ================= 起動 ================= */
 
@@ -1952,12 +2275,61 @@ async function boot() {
 
 /* ================= キーボードショートカット ================= */
 
-const SHORTCUTS = 'C: チケット作成 / /: 検索 / Esc: ダイアログを閉じる / ?: この一覧';
+const SHORTCUTS = [
+  ['C', 'チケット作成'],
+  ['/', '検索欄へ移動'],
+  ['J / K', '次 / 前のチケットを選ぶ(ボード・リスト)'],
+  ['Enter', '選んだチケットを開く'],
+  ['E', '説明を編集(チケットの詳細で)'],
+  ['Ctrl+Enter', 'コメントを送信・説明を保存'],
+  ['Esc', 'ダイアログを閉じる(編集中は編集を終える)'],
+  ['?', 'この一覧'],
+];
+
+function openHelp() {
+  state.openId = null;
+  dlg.className = 'dlg narrow';
+  setDialog(
+    h('div', { class: 'dlg-head' }, h('strong', null, 'キーボードショートカット'), h('span', { class: 'spacer' }),
+      h('button', { class: 'btn ghost', type: 'button', onclick: () => dlg.close() }, '✕')),
+    h('div', { class: 'dlg-body' },
+      h('table', { class: 'shortcuts' }, h('tbody', null, SHORTCUTS.map(([k, d]) => h('tr', null, h('td', null, h('kbd', null, k)), h('td', null, d))))),
+      h('div', { class: 'note' }, '入力欄にカーソルがあるときは、Ctrl+Enter と Esc 以外は反応しません。')));
+  if (!dlg.open) dlg.showModal();
+}
+
+/** J/K でボード・リストのチケットを順に選ぶ(ボードは列ごとに上から) */
+function moveCursor(step) {
+  const els = [...$('main').querySelectorAll('[data-id]')];
+  if (!els.length) return;
+  let i = els.findIndex((el) => el.dataset.id === state.cursor);
+  i = i < 0 ? (step > 0 ? 0 : els.length - 1) : Math.min(els.length - 1, Math.max(0, i + step));
+  state.cursor = els[i].dataset.id;
+  for (const el of els) el.classList.toggle('cursor', el === els[i]);
+  els[i].scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}
+
 document.addEventListener('keydown', (e) => {
-  if ($('app').hidden || dlg.open || e.ctrlKey || e.altKey || e.metaKey || e.isComposing) return;
+  if ($('app').hidden || e.ctrlKey || e.altKey || e.metaKey || e.isComposing) return;
   const a = document.activeElement;
   if (a && (/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) || a.isContentEditable)) return;
-  if (e.key === 'c' || e.key === 'C') {
+  if (dlg.open) {
+    // 詳細ダイアログの中: E で説明を編集
+    if (state.openId && (e.key === 'e' || e.key === 'E')) {
+      const v = dlg.querySelector('.desc-view');
+      if (v) { e.preventDefault(); v.click(); }
+    }
+    return;
+  }
+  const inList = state.view === 'board' || state.view === 'list';
+  if (inList && (e.key === 'j' || e.key === 'J' || e.key === 'k' || e.key === 'K')) {
+    e.preventDefault();
+    moveCursor(e.key.toLowerCase() === 'j' ? 1 : -1);
+  } else if (inList && e.key === 'Enter' && state.cursor && !(a && /^(BUTTON|A)$/.test(a.tagName))) {
+    if (!$('main').querySelector(`[data-id="${CSS.escape(state.cursor)}"]`)) return;
+    e.preventDefault();
+    openTicket(state.cursor);
+  } else if (e.key === 'c' || e.key === 'C') {
     e.preventDefault();
     openCreateDialog();
   } else if (e.key === '/') {
@@ -1967,7 +2339,7 @@ document.addEventListener('keydown', (e) => {
     if (q) q.focus();
   } else if (e.key === '?') {
     e.preventDefault();
-    toast(SHORTCUTS);
+    openHelp();
   }
 });
 
