@@ -509,8 +509,11 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   // 利用者ID: 設定に自分の ID が出る。存在しない ID は引き継げない
   await page.click('#nav >> text=設定');
   assert.ok(/^u-[a-z0-9]{8}$/.test(await page.textContent('[data-testid=my-id]')));
-  await page.fill('.panel:has(h2:text-is("利用者ID")) input', 'u-nobody00');
-  await page.click('.panel:has(h2:text-is("利用者ID")) button:text-is("引き継ぐ")');
+  // 利用者IDはプロフィールの中にまとめてある(独立したパネルは無い)
+  assert.strictEqual(await page.locator('.panel:has(h2:text-is("利用者ID"))').count(), 0);
+  assert.strictEqual(await page.locator('.panel:has(h2:text-is("プロフィール")) [data-testid=my-id]').count(), 1);
+  await page.fill('.user-id input', 'u-nobody00');
+  await page.click('.user-id button:text-is("引き継ぐ")');
   await page.waitForSelector('#toast:has-text("u-nobody00」のメンバーは見つかりません")');
 
   // プロジェクトテンプレート: 設定画面で作る(タイトルが空の行があると保存できない)
@@ -691,6 +694,66 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   await page.click('#dlg button[type=submit]');
   await page.waitForSelector('#toast:has-text("「__proto__」はプロジェクト名に使えません")');
   await closeDialog();
+
+  // 種別ごとのキー接頭辞: バグだけ BUG、番号は全体の通し番号。種別を変えてもキーは変わらない
+  await page.click('#nav >> text=設定');
+  assert.strictEqual(await page.locator('.panel label:text-is("チケットのステータス(1行に1つ。左から順にボードの列になり、最後の行が「完了」扱い)")').count(), 1);
+  await page.fill('.type-keys input[data-type="バグ"]', 'bug!');
+  await page.click('.panel >> text=保存 >> nth=0');
+  await page.waitForSelector('#toast:has-text("設定を保存しました")');
+  assert.strictEqual(await page.inputValue('.type-keys input[data-type="バグ"]'), 'BUG', '接頭辞は英大文字と数字にそろえること');
+  await page.click('#nav >> text=ボード');
+  await page.keyboard.press('c');
+  await page.waitForSelector('#dlg.narrow[open]');
+  await page.fill('#dlg input[type=text]', '接頭辞のバグ');
+  await page.selectOption('#dlg select:has(option[value="バグ"])', 'バグ');
+  await page.click('#dlg button[type=submit]');
+  await page.waitForSelector('.ticket-main');
+  const bugKey = await page.textContent('#dlg .dlg-head .key');
+  assert.ok(/^BUG-\d+$/.test(bugKey), `バグは BUG で始まること: ${bugKey}`);
+  await page.selectOption('.ticket-side select:has(option[value="バグ"])', 'タスク');
+  await page.waitForSelector('#toast');
+  assert.strictEqual(await page.textContent('#dlg .dlg-head .key'), bugKey, '種別を変えてもキーは変わらないこと');
+  await closeDialog();
+  await page.keyboard.press('c');
+  await page.waitForSelector('#dlg.narrow[open]');
+  await page.fill('#dlg input[type=text]', '接頭辞のタスク');
+  await page.click('#dlg button[type=submit]');
+  await page.waitForSelector('.ticket-main');
+  const taskKey = await page.textContent('#dlg .dlg-head .key');
+  assert.strictEqual(taskKey, `TK-${Number(bugKey.split('-')[1]) + 1}`, '番号は種別にかかわらず通し番号');
+  await closeDialog();
+
+  // ショートカットの割り当て: チケット作成を T に変える → T で開き C では開かない。リロード後も残り、既定に戻せる
+  await page.click('#nav >> text=設定');
+  await page.click('[data-testid=shortcut-panel] button[data-action=create]');
+  await page.keyboard.press('t');
+  await page.waitForSelector('[data-testid=shortcut-panel] tr:has(button[data-action=create]) kbd:text-is("T")');
+  // 割り当て済みのキー(J = 次のチケット)を選ぶと、確認のうえ相手を外す
+  await page.click('[data-testid=shortcut-panel] button[data-action=refresh]');
+  await page.keyboard.press('j');
+  await page.waitForSelector('[data-testid=shortcut-panel] tr:has(button[data-action=next]) kbd:text-is("なし")');
+  assert.ok(dialogs.at(-1).includes('「次のチケットを選ぶ'), `確認の文言: ${dialogs.at(-1)}`);
+  await page.reload();
+  await page.waitForSelector('#main');
+  await page.locator('body').click({ position: { x: 5, y: 5 } });
+  await page.keyboard.press('2');
+  await page.waitForSelector('#nav button.active:text-is("リスト")');
+  await page.keyboard.press('c');
+  await page.waitForTimeout(200);
+  assert.strictEqual(await page.locator('#dlg[open]').count(), 0, '割り当てを変えた後の C では作成ダイアログを開かないこと');
+  await page.keyboard.press('t');
+  await page.waitForSelector('#dlg.narrow[open]');
+  await closeDialog();
+  assert.strictEqual(await page.getAttribute('#btnCreate', 'title'), 'チケット作成 (T)');
+  await page.locator('body').click({ position: { x: 5, y: 5 } });
+  await page.keyboard.press('?');
+  await page.waitForSelector('#dlg .shortcuts tr:has(kbd:text-is("T")):has-text("チケット作成")');
+  await closeDialog();
+  await page.click('#nav >> text=設定');
+  await page.click('[data-testid=shortcut-panel] button:text-is("既定に戻す")');
+  await page.waitForSelector('[data-testid=shortcut-panel] tr:has(button[data-action=create]) kbd:text-is("C")');
+  assert.strictEqual(await page.evaluate(() => localStorage.getItem('tb.keys')), 'null');
 
   assert.deepStrictEqual(errors, [], 'ブラウザのエラーがないこと');
   await browser.close();

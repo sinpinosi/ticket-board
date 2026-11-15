@@ -336,6 +336,24 @@ kbd {
   display: inline-block; padding: 1px 6px; border: 1px solid var(--border); border-bottom-width: 2px;
   border-radius: 4px; font-family: inherit; font-size: 12px; background: var(--surface-2); white-space: nowrap;
 }
+kbd.none { color: var(--muted); border-style: dashed; }
+.shortcut-edit td:first-child { width: 100%; }
+.shortcut-edit td:nth-child(3) { text-align: right; white-space: nowrap; }
+.shortcut-edit td:nth-child(3) .btn + .btn { margin-left: 4px; }
+/* スマホ幅では、操作名を1行目に、キーとボタンを2行目に並べる */
+@media (max-width: 600px) {
+  .shortcut-edit tr { display: grid; grid-template-columns: 1fr auto; border-bottom: 1px solid var(--border); padding: 4px 0; }
+  .shortcut-edit td { border-bottom: none; padding: 2px 4px; }
+  .shortcut-edit td:first-child { grid-column: 1 / -1; width: auto; }
+}
+
+/* ---------- 設定: 種別ごとの接頭辞・利用者ID ---------- */
+.type-keys { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 6px 12px; }
+.panel .type-key { display: flex; align-items: center; gap: 8px; margin: 0; }
+.type-key-name { flex: 0 0 auto; max-width: 50%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.type-key input { flex: 1 1 auto; min-width: 0; }
+.user-id { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }
+.user-id h3 { margin: 0 0 4px; font-size: 14px; }
 
 /* ---------- テンプレート ---------- */
 .tpl-list { margin-bottom: 6px; }

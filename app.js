@@ -20,6 +20,8 @@
 const DEFAULT_CONFIG = {
   projectName: 'マイプロジェクト',
   key: 'TK',
+  // 種別ごとのキー接頭辞 {種別名: 接頭辞}。無い種別は key を使う
+  typeKeys: {},
   statuses: ['未着手', '進行中', 'レビュー中', '完了'],
   types: ['タスク', 'バグ', '要望', '問い合わせ'],
   priorities: ['高', '中', '低'],
@@ -211,10 +213,10 @@ function referencedTickets(text, selfId) {
 
 /** 本文中のキーのうち、この保存先のキー(接頭辞が同じもの)なのにチケットが無いもの */
 function missingKeys(text) {
-  const prefix = state.config.key + '-';
-  if (!/^[A-Z]/.test(state.config.key)) return [];
+  // 英字で始まらない接頭辞(数字だけ)は、日付などと見分けられないので対象にしない
+  const prefixes = [...allPrefixes()].filter((p) => /^[A-Z]/.test(p));
   const out = new Set();
-  for (const m of String(text ?? '').matchAll(KEY_RE)) if (m[0].startsWith(prefix) && !findByKey(m[0])) out.add(m[0]);
+  for (const m of String(text ?? '').matchAll(KEY_RE)) if (prefixes.includes(keyPrefix(m[0])) && !findByKey(m[0])) out.add(m[0]);
   return [...out];
 }
 
@@ -613,6 +615,21 @@ async function removeTemplate(tpl) {
   log('template.remove', '', `${TEMPLATE_KINDS[tpl.kind]}「${tpl.name}」`);
 }
 
+/** キー接頭辞の入力を整える(英大文字と数字だけ・10文字まで) */
+const cleanPrefix = (v) => String(v ?? '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 10);
+
+/** 共有データの typeKeys を {種別名: 接頭辞} に整える(fromEntries なので __proto__ も普通の値になる) */
+function normalizeTypeKeys(v) {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return {};
+  return Object.fromEntries(Object.entries(v).map(([k, p]) => [String(k), cleanPrefix(p)]).filter(([, p]) => p));
+}
+
+/** 種別に対応するキー接頭辞(種別ごとの設定が無ければ既定の接頭辞) */
+const prefixFor = (type) => (Object.hasOwn(state.config.typeKeys, type) && state.config.typeKeys[type]) || state.config.key;
+
+/** この保存先で使っている接頭辞すべて */
+const allPrefixes = () => new Set([state.config.key, ...Object.values(state.config.typeKeys)]);
+
 async function loadConfig() {
   const c = await readJson(state.root, 'config.json');
   if (!c) return false;
@@ -620,6 +637,7 @@ async function loadConfig() {
   state.config = {
     projectName: String(c.projectName || DEFAULT_CONFIG.projectName),
     key: String(c.key || DEFAULT_CONFIG.key),
+    typeKeys: normalizeTypeKeys(c.typeKeys),
     statuses: list(c.statuses, DEFAULT_CONFIG.statuses),
     types: list(c.types, DEFAULT_CONFIG.types),
     priorities: list(c.priorities, DEFAULT_CONFIG.priorities),
@@ -738,7 +756,8 @@ async function createTickets(items) {
         const parent = it.parent || '';
         if (parent && !state.tickets.has(parent)) throw new Error(notFoundMsg('親チケット'));
         num++;
-        const key = `${state.config.key}-${num}`;
+        // 接頭辞は作成時の種別で決める(後で種別を変えてもキーは変えない)。番号は全体の通し番号
+        const key = `${prefixFor(it.type)}-${num}`;
         // 同時作成で番号が重複してもファイルが上書きされないよう、ランダムな接尾辞を付ける
         const id = `${safeName(key)}-${uid(4)}`;
         const now = nowIso();
@@ -868,6 +887,8 @@ async function setField(id, field, value, { undo = false } = {}) {
 const byCreated = (a, b) => String(a.createdAt).localeCompare(String(b.createdAt)) || a.id.localeCompare(b.id);
 const isConflictCopy = (a, b) => a.createdAt === b.createdAt && a.title === b.title;
 const keyPrefix = (key) => String(key).replace(/-\d+$/, '');
+/** 振り直しに使う接頭辞(元のキーの接頭辞。共有データ由来で形式外のときは既定の接頭辞) */
+const renumberPrefix = (key) => { const p = keyPrefix(key); return /^[A-Z0-9]+$/.test(p) ? p : state.config.key; };
 /** 番号として使える値だけを数える(Infinity や巨大値で TK-Infinity にならないように) */
 const numOf = (x) => { const n = Number(x && x.num); return Number.isSafeInteger(n) && n > 0 ? n : 0; };
 const maxNum = (extra = []) => {
@@ -911,7 +932,7 @@ async function fixDuplicateKeys() {
       if (group.length < 2 || group[0].id === t.id) return null;
       const num = maxNum() + 1;
       fresh.num = num;
-      fresh.key = `${keyPrefix(oldKey)}-${num}`;
+      fresh.key = `${renumberPrefix(oldKey)}-${num}`;
       fresh.history.push({ at: nowIso(), by: state.me.id, field: 'キー', from: oldKey, to: `${fresh.key}(番号の重複を自動で振り直し)` });
       fresh.updatedAt = nowIso();
       fresh.updatedBy = state.me.id;
@@ -1280,7 +1301,7 @@ async function importBackup(file) {
         if (usedKeys.has(t.key)) {
           const oldKey = t.key;
           t.num = ++max;
-          t.key = `${state.config.key}-${t.num}`;
+          t.key = `${renumberPrefix(oldKey)}-${t.num}`;
           t.history.push({ at: nowIso(), by: state.me.id, field: 'キー', from: oldKey, to: `${t.key}(バックアップの読み込み時に振り直し)` });
         }
         await writeJson(state.dirs.tickets, t.id + '.json', t);
@@ -1659,13 +1680,30 @@ function viewSettings() {
   const projectStatuses = h('textarea', { rows: 4, value: c.projectStatuses.join('\n') });
   const lines = (el) => [...new Set(el.value.split('\n').map((s) => s.trim()).filter(Boolean))];
 
+  // 種別ごとの接頭辞。種別の欄を書き換えたら表を作り直す(入力済みの値は種別名で引き継ぐ)
+  const typeKeyDraft = new Map(Object.entries(c.typeKeys));
+  const typeKeyTable = h('div', { class: 'type-keys' });
+  const renderTypeKeys = () => {
+    typeKeyTable.replaceChildren(...lines(types).map((t) => h('label', { class: 'type-key' },
+      h('span', { class: 'type-key-name' }, t),
+      h('input', {
+        type: 'text', maxLength: 10, value: typeKeyDraft.get(t) || '', placeholder: `既定(${cleanPrefix(key.value) || DEFAULT_CONFIG.key})`,
+        'data-type': t, oninput: (e) => typeKeyDraft.set(t, e.target.value),
+      }))));
+  };
+  types.addEventListener('input', renderTypeKeys);
+  key.addEventListener('input', renderTypeKeys);
+  renderTypeKeys();
+
   const saveConfig = guard(async () => {
     const fields = {
       projectName: name.value.trim() || DEFAULT_CONFIG.projectName,
-      key: (key.value.trim().toUpperCase().replace(/[^A-Z0-9]/g, '') || DEFAULT_CONFIG.key),
+      key: cleanPrefix(key.value) || DEFAULT_CONFIG.key,
       statuses: lines(statuses), types: lines(types), projectStatuses: lines(projectStatuses),
     };
-    if (fields.statuses.length < 2) { toast('ステータスは2つ以上必要です', true); return; }
+    // 今の種別にあるものだけ残す(種別名を変えた・消したものの接頭辞は捨てる)
+    fields.typeKeys = Object.fromEntries(fields.types.map((t) => [t, cleanPrefix(typeKeyDraft.get(t))]).filter(([, p]) => p));
+    if (fields.statuses.length < 2) { toast('チケットのステータスは2つ以上必要です', true); return; }
     if (!fields.types.length) { toast('種別は1つ以上必要です', true); return; }
     if (fields.projectStatuses.length < 2) { toast('プロジェクトのステータスは2つ以上必要です', true); return; }
     // 最後の行(完了)の名前を変えると、完了済みのプロジェクトが黙って未完了に戻るので、読み替えるか確かめる
@@ -1689,9 +1727,11 @@ function viewSettings() {
       h('h2', null, 'プロジェクト設定'),
       h('div', { class: 'note' }, '全メンバーに反映されます(共有フォルダの config.json)。'),
       h('label', null, 'ボード名(画面の左上とタブに表示)'), name,
-      h('label', null, 'チケットキーの接頭辞(変更後に作成するチケットから適用)'), key,
-      h('label', null, 'ステータス(1行に1つ。左から順にボードの列になり、最後の行が「完了」扱い)'), statuses,
+      h('label', null, 'チケットのステータス(1行に1つ。左から順にボードの列になり、最後の行が「完了」扱い)'), statuses,
       h('label', null, '種別(1行に1つ)'), types,
+      h('label', null, 'チケットキーの接頭辞(既定)'), key,
+      h('label', null, '種別ごとの接頭辞(空欄は既定の接頭辞を使います)'), typeKeyTable,
+      h('div', { class: 'note' }, '接頭辞は変更後に作成するチケットから適用します。作成後に種別を変えてもキーは変わりません。番号は種別にかかわらず通し番号です。種別の名前を変えたときは、接頭辞を設定し直してください。'),
       h('label', null, 'プロジェクトのステータス(1行に1つ。最後の行が「完了」扱いで、完了したプロジェクトのチケットはボード・リストに出なくなります)'), projectStatuses,
       h('div', { class: 'note' }, 'プロジェクトの作成・名前の変更は「プロジェクト」画面で行います。'),
       h('div', { class: 'toolbar' }, h('button', { class: 'btn primary', onclick: saveConfig }, '保存'))),
@@ -1706,8 +1746,9 @@ function viewSettings() {
         renderChrome();
         renderMain();
         toast('プロフィールを保存しました');
-      }))),
-    takeOverPanel(),
+      }), { showId: false }),
+      userIdSection()),
+    shortcutPanel(),
     h('div', { class: 'panel' },
       h('h2', null, 'データ保存先'),
       h('div', { class: 'path' }, lsGet('tb.mode') === 'demo' ? 'お試しモード(このブラウザ内のみ・他の人とは共有されません)' : `フォルダ: ${state.root.name}`),
@@ -1782,7 +1823,8 @@ async function detectDevice() {
 
 const newUserId = () => `u-${uid(8)}`;
 
-function profileForm(submitLabel, onSaved) {
+/** showId: 利用者IDの注記を出すか(設定画面では下の「利用者ID」欄に出すので出さない) */
+function profileForm(submitLabel, onSaved, { showId = true } = {}) {
   const me = state.me || {};
   const name = h('input', { type: 'text', value: me.name || '', required: true, maxLength: 40, placeholder: '例: 山田 太郎' });
   const device = h('input', { type: 'text', value: me.device || '', maxLength: 40, placeholder: '例: 自席の PC(任意)' });
@@ -1802,12 +1844,15 @@ function profileForm(submitLabel, onSaved) {
   },
     h('label', null, '名前(担当者や操作ログに表示されます)'), name,
     h('label', null, '端末名(自動で入ります。分かりやすい名前に変えても構いません)'), device,
-    me.id ? h('div', { class: 'note' }, `利用者ID: ${me.id}`) : h('div', { class: 'note' }, '利用者IDは自動で作られます。メールアドレスなどの入力は不要です。'),
+    !showId ? null : me.id ? h('div', { class: 'note' }, `利用者ID: ${me.id}`) : h('div', { class: 'note' }, '利用者IDは自動で作られます。メールアドレスなどの入力は不要です。'),
     h('div', { class: 'actions toolbar' }, h('button', { class: 'btn primary', type: 'submit' }, submitLabel)));
 }
 
-/** 別の端末・ブラウザで使っている利用者IDに切り替える(同じ人として扱われるようにする) */
-function takeOverPanel() {
+/**
+ * 設定画面のプロフィール欄の中に出す「利用者ID」。表示・コピーと、
+ * 別の端末・ブラウザで使っている利用者IDへの切り替え(同じ人として扱われるようにする)
+ */
+function userIdSection() {
   const input = h('input', { type: 'text', maxLength: 100, placeholder: '例: u-7k3m9xab' });
   const apply = guard(async () => {
     const id = input.value.trim();
@@ -1834,8 +1879,8 @@ function takeOverPanel() {
     renderMain();
     toast(`「${u.name || u.id}」として使います`);
   });
-  return h('div', { class: 'panel' },
-    h('h2', null, '利用者ID'),
+  return h('div', { class: 'user-id' },
+    h('h3', null, '利用者ID'),
     h('div', { class: 'note' }, 'このブラウザでのあなたの利用者IDです。別の PC やブラウザでも同じ人として使うときは、そちらで下の欄にこの ID を入力してください。'),
     h('div', { class: 'row' }, h('div', { class: 'path', 'data-testid': 'my-id' }, state.me.id),
       h('button', { class: 'btn small', onclick: guard(async () => { await navigator.clipboard.writeText(state.me.id); toast('利用者IDをコピーしました'); }) }, 'コピー')),
@@ -2860,27 +2905,170 @@ async function boot() {
 
 /* ================= キーボードショートカット ================= */
 
-const SHORTCUTS = [
-  ['C', 'チケット作成'],
-  ['/', '検索欄へ移動'],
-  ['J / K', '次 / 前のチケットを選ぶ(ボード・リスト)'],
-  ['Enter', '選んだチケットを開く'],
-  ['E', '説明を編集(チケットの詳細で)'],
+/*
+ * 割り当ては利用者ごとの好みなので、このブラウザの localStorage(tb.keys = {操作id: キー})にだけ持つ。
+ * 既定と違うものだけを保存し、'' は「割り当てなし」。キーは keyName() の形(英字は大文字)。
+ * 操作を足すときは SHORTCUT_ACTIONS に足す(設定画面とヘルプの一覧は、ここから作る)。
+ */
+const KEYS_STORE = 'tb.keys';
+const inListView = () => state.view === 'board' || state.view === 'list';
+const goView = (id) => { state.view = id; renderChrome(); renderMain(); };
+
+/**
+ * scope: 'dialog' はダイアログが開いているときだけ、それ以外はダイアログが閉じているときだけ動く。
+ * when(a): 動かせる状況か(a はフォーカスのある要素)。false のときはキーをブラウザに任せる
+ */
+const SHORTCUT_ACTIONS = [
+  { id: 'create', label: 'チケット作成', def: 'C', run: () => openCreateDialog() },
+  {
+    id: 'search', label: '検索欄へ移動', def: '/', run: () => {
+      if (!inListView()) goView('board');
+      const q = $('filters').querySelector('input[type=search]');
+      if (q) q.focus();
+    },
+  },
+  { id: 'next', label: '次のチケットを選ぶ(ボード・リスト)', def: 'J', when: inListView, run: () => moveCursor(1) },
+  { id: 'prev', label: '前のチケットを選ぶ(ボード・リスト)', def: 'K', when: inListView, run: () => moveCursor(-1) },
+  {
+    id: 'open', label: '選んだチケットを開く(ボード・リスト)', def: 'Enter',
+    // ボタン・リンクにフォーカスがあるときの Enter は、そちらを押す操作に譲る
+    when: (a) => inListView() && state.cursor && !(a && /^(BUTTON|A)$/.test(a.tagName))
+      && !!$('main').querySelector(`[data-id="${CSS.escape(state.cursor)}"]`),
+    run: () => openTicket(state.cursor),
+  },
+  {
+    id: 'editDesc', label: '説明を編集(チケットの詳細で)', def: 'E', scope: 'dialog',
+    when: () => !!(state.openId && dlg.querySelector('.desc-view')),
+    run: () => dlg.querySelector('.desc-view').click(),
+  },
+  ...VIEWS.map(([id, label], i) => ({ id: `view.${id}`, label: `「${label}」画面へ`, def: String(i + 1), run: () => goView(id) })),
+  { id: 'refresh', label: '今すぐ再読み込み', def: 'R', run: guard(() => refresh(true)) },
+  { id: 'unread', label: '新着のみ表示(新着があるとき)', def: 'N', when: () => !$('btnUnread').hidden, run: () => $('btnUnread').click() },
+  { id: 'clearFilters', label: '検索・絞り込みを解除(ボード・リスト)', def: '', when: () => inListView() && isFiltering(), run: () => clearFilters() },
+  { id: 'help', label: 'ショートカットの一覧', def: '?', run: () => openHelp() },
+];
+
+/** 変更できないもの(入力欄の中でも動く) */
+const FIXED_SHORTCUTS = [
   ['Ctrl+Enter', 'コメントを送信・説明を保存'],
   ['Esc', 'ダイアログを閉じる(編集中は編集を終える)'],
-  ['?', 'この一覧'],
 ];
+
+/** 単体では押されても無視するキー(修飾キーそのもの・IME の切り替えなど。Shift を押してから ? を押す、などのため) */
+const IGNORED_KEYS = new Set(['Shift', 'Control', 'Alt', 'Meta', 'AltGraph', 'CapsLock', 'NumLock', 'ScrollLock',
+  'Process', 'Unidentified', 'Dead', 'Compose', 'KanaMode', 'KanjiMode', 'Convert', 'NonConvert', 'HiraganaKatakana', 'Hankaku', 'Zenkaku', 'Romaji', 'Eisu']);
+/** 割り当てられないキー(フォーカス移動・ダイアログを閉じる・ブラウザの機能キー) */
+const isReservedKey = (k) => ['Escape', 'Tab', ' ', 'ContextMenu', 'Backspace'].includes(k) || /^F\d+$/.test(k);
+
+/** キーの名前(英字は大文字にそろえる。Shift の有無は区別しない) */
+const keyName = (e) => (e.key.length === 1 ? e.key.toUpperCase() : e.key);
+
+const keyLabel = (k) => k || 'なし';
+
+/** 今の割り当て {操作id: キー}('' は割り当てなし) */
+function shortcutKeys() {
+  const saved = lsGet(KEYS_STORE);
+  const obj = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+  return Object.fromEntries(SHORTCUT_ACTIONS.map((x) => [x.id, Object.hasOwn(obj, x.id) ? String(obj[x.id]) : x.def]));
+}
+
+/** 割り当てを保存する(既定と同じものは保存しない) */
+function saveShortcutKeys(keys) {
+  const diff = Object.fromEntries(SHORTCUT_ACTIONS.filter((x) => keys[x.id] !== x.def).map((x) => [x.id, keys[x.id]]));
+  lsSet(KEYS_STORE, Object.keys(diff).length ? diff : null);
+  updateShortcutTitles();
+}
+
+/** ボタンのツールチップに今のキーを出す */
+function updateShortcutTitles() {
+  const k = shortcutKeys().create;
+  $('btnCreate').title = k ? `チケット作成 (${k})` : 'チケット作成';
+}
 
 function openHelp() {
   state.openId = null;
   dlg.className = 'dlg narrow';
+  const keys = shortcutKeys();
+  const rows = [
+    ...SHORTCUT_ACTIONS.filter((x) => keys[x.id]).map((x) => [keys[x.id], x.label]),
+    ...FIXED_SHORTCUTS,
+  ];
   setDialog(
     h('div', { class: 'dlg-head' }, h('strong', null, 'キーボードショートカット'), h('span', { class: 'spacer' }),
       h('button', { class: 'btn ghost', type: 'button', onclick: () => dlg.close() }, '✕')),
     h('div', { class: 'dlg-body' },
-      h('table', { class: 'shortcuts' }, h('tbody', null, SHORTCUTS.map(([k, d]) => h('tr', null, h('td', null, h('kbd', null, k)), h('td', null, d))))),
-      h('div', { class: 'note' }, '入力欄にカーソルがあるときは、Ctrl+Enter と Esc 以外は反応しません。')));
+      h('table', { class: 'shortcuts' }, h('tbody', null, rows.map(([k, d]) => h('tr', null, h('td', null, h('kbd', null, k)), h('td', null, d))))),
+      h('div', { class: 'note' }, '入力欄にカーソルがあるときは、Ctrl+Enter と Esc 以外は反応しません。'),
+      h('div', { class: 'note' }, 'キーの割り当ては「設定」画面の「キーボードショートカット」で変えられます。')));
   if (!dlg.open) dlg.showModal();
+}
+
+/** 設定画面: ショートカットの割り当て(このブラウザだけ) */
+function shortcutPanel() {
+  const panel = h('div', { class: 'panel', 'data-testid': 'shortcut-panel' });
+  let stopCapture = null;
+  const render = () => {
+    if (stopCapture) stopCapture();
+    const keys = shortcutKeys();
+    const assign = (id, k) => {
+      const next = { ...keys };
+      const other = k && SHORTCUT_ACTIONS.find((x) => x.id !== id && next[x.id] === k);
+      if (other && !confirm(`「${k}」は「${other.label}」に割り当てられています。\n「${other.label}」の割り当てを外して、こちらに割り当てますか?`)) return;
+      if (other) next[other.id] = '';
+      next[id] = k;
+      saveShortcutKeys(next);
+      render();
+    };
+    // 「変更」を押したら、次に押されたキーを取り込む(Esc で取り消し)
+    const capture = (x, btn) => {
+      if (stopCapture) stopCapture();
+      btn.textContent = 'キーを押す…';
+      btn.title = '割り当てるキーを押してください(Esc で取り消し)';
+      btn.classList.add('primary');
+      const onKey = (e) => {
+        // 設定画面が描き直されて、この欄が無くなっていたら取り込みをやめる
+        if (!panel.isConnected) { stop(); return; }
+        if (e.isComposing || IGNORED_KEYS.has(e.key)) return;
+        // 他のショートカットやボタンの操作として動かないよう、ここで止める
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.key === 'Escape') { render(); return; }
+        if (e.ctrlKey || e.altKey || e.metaKey) { toast('Ctrl・Alt などを押しながらのキーは使えません。1つのキーを押してください', true); return; }
+        if (isReservedKey(e.key)) { toast(`「${e.key === ' ' ? 'スペース' : e.key}」は割り当てられません`, true); return; }
+        assign(x.id, keyName(e));
+      };
+      const stop = () => { window.removeEventListener('keydown', onKey, true); btn.removeEventListener('blur', onBlur); stopCapture = null; };
+      const onBlur = () => { stop(); btn.textContent = '変更'; btn.title = ''; btn.classList.remove('primary'); };
+      window.addEventListener('keydown', onKey, true);
+      btn.addEventListener('blur', onBlur);
+      stopCapture = stop;
+    };
+    panel.replaceChildren(
+      h('h2', null, 'キーボードショートカット'),
+      h('div', { class: 'note' }, 'このブラウザだけに保存されます(他のメンバーには影響しません)。入力欄にカーソルがあるときは反応しません。'),
+      h('table', { class: 'shortcuts shortcut-edit' }, h('tbody', null,
+        SHORTCUT_ACTIONS.map((x) => {
+          const btn = h('button', { type: 'button', class: 'btn small', 'data-action': x.id }, '変更');
+          btn.addEventListener('click', () => capture(x, btn));
+          return h('tr', null,
+            h('td', null, x.label),
+            h('td', { class: 'nowrap' }, h('kbd', { class: keys[x.id] ? '' : 'none' }, keyLabel(keys[x.id]))),
+            h('td', { class: 'nowrap' }, btn,
+              h('button', { type: 'button', class: 'btn small ghost', disabled: !keys[x.id], onclick: () => assign(x.id, '') }, 'なし')));
+        }),
+        FIXED_SHORTCUTS.map(([k, d]) => h('tr', null, h('td', null, d), h('td', { class: 'nowrap' }, h('kbd', null, k)), h('td', { class: 'note' }, '変更できません'))))),
+      h('div', { class: 'toolbar' }, h('button', {
+        type: 'button', class: 'btn',
+        onclick: () => {
+          if (!confirm('ショートカットをすべて既定の割り当てに戻しますか?')) return;
+          saveShortcutKeys(Object.fromEntries(SHORTCUT_ACTIONS.map((x) => [x.id, x.def])));
+          render();
+          toast('ショートカットを既定に戻しました');
+        },
+      }, '既定に戻す')));
+  };
+  render();
+  return panel;
 }
 
 /** J/K でボード・リストのチケットを順に選ぶ(ボードは列ごとに上から) */
@@ -2898,37 +3086,20 @@ document.addEventListener('keydown', (e) => {
   if ($('app').hidden || e.ctrlKey || e.altKey || e.metaKey || e.isComposing) return;
   const a = document.activeElement;
   if (a && (/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) || a.isContentEditable)) return;
-  if (dlg.open) {
-    // 詳細ダイアログの中: E で説明を編集
-    if (state.openId && (e.key === 'e' || e.key === 'E')) {
-      const v = dlg.querySelector('.desc-view');
-      if (v) { e.preventDefault(); v.click(); }
-    }
-    return;
-  }
-  const inList = state.view === 'board' || state.view === 'list';
-  if (inList && (e.key === 'j' || e.key === 'J' || e.key === 'k' || e.key === 'K')) {
-    e.preventDefault();
-    moveCursor(e.key.toLowerCase() === 'j' ? 1 : -1);
-  } else if (inList && e.key === 'Enter' && state.cursor && !(a && /^(BUTTON|A)$/.test(a.tagName))) {
-    if (!$('main').querySelector(`[data-id="${CSS.escape(state.cursor)}"]`)) return;
-    e.preventDefault();
-    openTicket(state.cursor);
-  } else if (e.key === 'c' || e.key === 'C') {
-    e.preventDefault();
-    openCreateDialog();
-  } else if (e.key === '/') {
-    e.preventDefault();
-    if (state.view !== 'board' && state.view !== 'list') { state.view = 'board'; renderChrome(); renderMain(); }
-    const q = $('filters').querySelector('input[type=search]');
-    if (q) q.focus();
-  } else if (e.key === '?') {
-    e.preventDefault();
-    openHelp();
-  }
+  const k = keyName(e);
+  // ボタン・リンクにフォーカスがあるときの Enter は、そちらを押す操作に譲る
+  if (k === 'Enter' && a && /^(BUTTON|A)$/.test(a.tagName)) return;
+  const keys = shortcutKeys();
+  const scope = dlg.open ? 'dialog' : 'main';
+  const x = SHORTCUT_ACTIONS.find((y) => keys[y.id] === k && (y.scope || 'main') === scope);
+  if (!x || (x.when && !x.when(a))) return;
+  // 押しっぱなしで連続して動いてよいのは、チケットを順に選ぶ操作だけ
+  if (e.repeat && x.id !== 'next' && x.id !== 'prev') { e.preventDefault(); return; }
+  e.preventDefault();
+  x.run();
 });
 
-$('btnCreate').title = 'チケット作成 (C)';
+updateShortcutTitles();
 $('btnCreate').addEventListener('click', openCreateDialog);
 $('btnSync').addEventListener('click', guard(() => refresh(true)));
 $('btnUnread').addEventListener('click', () => {
