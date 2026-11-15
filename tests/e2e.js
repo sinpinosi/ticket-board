@@ -72,6 +72,13 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   await page.waitForSelector('.ticket-main');
   // 説明はふだんは表示で、押すと編集。欄の外に出ると保存して、URL がリンクになる
   assert.strictEqual(await page.locator('.ticket-main .desc-edit').count(), 0, '最初は表示のみ');
+  // 編集できる場所(タイトル・説明)にはペンマークを出す。参照キーが無いときに「null」と出ないこと
+  assert.strictEqual(await page.locator('.ticket-main .title-wrap .edit-pen').count(), 1);
+  assert.strictEqual(await page.locator('.ticket-main .desc-view .edit-pen').count(), 1);
+  assert.ok(!(await page.innerText('.ticket-main .desc')).includes('null'), '説明欄に null と出ないこと');
+  // タイトルのペンマークを押すとタイトルの編集が始まる
+  await page.click('.ticket-main .title-wrap .edit-pen');
+  assert.strictEqual(await page.evaluate(() => document.activeElement.className), 'title-input');
   await page.click('.ticket-main .desc-view');
   await page.fill('.ticket-main .desc-edit', '説明です https://example.com');
   await page.selectOption('.ticket-side select >> nth=0', '進行中');
@@ -350,14 +357,19 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   assert.ok(restored.some((r) => JSON.stringify(r.files) === JSON.stringify(['a (2).txt', 'a.txt'])), `添付が戻ること: ${JSON.stringify(restored)}`);
   assert.ok(restored.every((r) => r.checklist === 2), 'チェックリストも戻ること');
 
-  // プロジェクト: 設定で登録 → 作成時に選ぶ → カードに表示・フィルタで絞り込める
-  await page.click('#nav >> text=設定');
-  await page.fill('.panel textarea[placeholder^="例"]', 'Web\nアプリ\nWeb');
-  await page.click('.panel >> text=保存 >> nth=0');
-  await page.waitForSelector('#toast:has-text("設定を保存しました")');
-  await page.click('#nav >> text=ボード');
+  // プロジェクト: プロジェクト画面で作成 → 作成時に選ぶ → カードに表示・フィルタで絞り込める
+  for (const name of ['Web', 'アプリ']) {
+    await page.click('#nav button:text-is("プロジェクト")');
+    await page.click('button:text-is("＋ プロジェクトを作成")');
+    await page.fill('#dlg input[type=text]', name);
+    await page.click('#dlg button[type=submit]');
+    await page.waitForSelector(`#toast:has-text("プロジェクト「${name}」を作成しました")`);
+  }
+  // 作るとそのプロジェクトで絞り込んだボードが開く
   const projectFilter = '#filters select:has(option[value="Web"])';
-  assert.deepStrictEqual(await page.locator(`${projectFilter} option`).allTextContents(), ['プロジェクト: すべて', 'プロジェクトなし', 'Web', 'アプリ'], '重複は1つにまとめること');
+  assert.strictEqual(await page.inputValue(projectFilter), 'アプリ');
+  await page.selectOption(projectFilter, '');
+  assert.deepStrictEqual(await page.locator(`${projectFilter} option`).allTextContents(), ['プロジェクト: すべて', 'プロジェクトなし', 'Web', 'アプリ']);
   await page.click('#btnCreate');
   await page.fill('#dlg input[type=text]', 'Web の作業');
   await page.selectOption('#dlg select:has(option[value="Web"])', 'Web');
@@ -500,6 +512,185 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   await page.fill('.panel:has(h2:text-is("利用者ID")) input', 'u-nobody00');
   await page.click('.panel:has(h2:text-is("利用者ID")) button:text-is("引き継ぐ")');
   await page.waitForSelector('#toast:has-text("u-nobody00」のメンバーは見つかりません")');
+
+  // プロジェクトテンプレート: 設定画面で作る(タイトルが空の行があると保存できない)
+  await page.click('#templatePanel .section-title:has-text("プロジェクトテンプレート") button:text-is("＋ 追加")');
+  await page.fill('#dlg .dlg-body > input[type=text]', '立ち上げ');
+  await page.fill('#dlg .tpl-title >> nth=0', 'キックオフ');
+  await page.fill('#dlg .tpl-check >> nth=0', '日程調整\n資料準備\n');
+  await page.click('#dlg >> text=＋ チケットを追加');
+  await page.click('#dlg button:text-is("保存")');
+  await page.waitForSelector('#toast:has-text("チケット 2 のタイトルを入力してください")');
+  await page.fill('#dlg .tpl-title >> nth=1', '要件定義');
+  await page.fill('#dlg .tpl-desc >> nth=1', '要件をまとめる');
+  await page.click('#dlg button:text-is("保存")');
+  await page.waitForSelector('#toast:has-text("テンプレート「立ち上げ」を保存しました")');
+  // 再読み込みしても残っている(templates フォルダに保存されている)
+  await page.reload();
+  await page.waitForSelector('#templatePanel [data-kind=project] li');
+  assert.ok((await page.innerText('#templatePanel [data-kind=project] li')).includes('チケット 2 件'));
+
+  // チケットテンプレート
+  await page.click('#templatePanel .section-title:has-text("チケットテンプレート") button:text-is("＋ 追加")');
+  assert.strictEqual(await page.locator('#dlg >> text=＋ チケットを追加').count(), 0, 'チケットテンプレートは1件だけ');
+  await page.fill('#dlg .dlg-body > input[type=text]', 'バグ報告');
+  await page.fill('#dlg .tpl-title', '不具合: ');
+  await page.selectOption('#dlg .tpl-item select >> nth=0', 'バグ');
+  await page.fill('#dlg .tpl-item input[type=text] >> nth=1', 'バグ, 要確認');
+  await page.fill('#dlg .tpl-desc', '再現手順:');
+  await page.click('#dlg button:text-is("保存")');
+  await page.waitForSelector('#templatePanel [data-kind=ticket] li:has-text("バグ報告")');
+
+  // テンプレートを選んでプロジェクトを作ると、チケットがまとめて作られ、そのプロジェクトのボードが開く
+  await page.click('#nav button:text-is("プロジェクト")');
+  await page.click('button:text-is("＋ プロジェクトを作成")');
+  await page.fill('#dlg input[type=text]', 'Aプロジェクト');
+  await page.selectOption('#dlg select', { index: 1 });
+  assert.deepStrictEqual(await page.locator('#dlg .tpl-preview li').allTextContents(), ['キックオフ', '要件定義']);
+  await page.click('#dlg button[type=submit]');
+  await page.waitForSelector('#toast:has-text("プロジェクト「Aプロジェクト」とチケット 2 件を作成しました")');
+  await page.waitForSelector('.board');
+  assert.strictEqual(await page.inputValue(projectFilter), 'Aプロジェクト');
+  assert.strictEqual(await page.locator('.card').count(), 2);
+  const kickoff = '.card:has(.title:text-is("キックオフ"))';
+  assert.strictEqual(await page.textContent(`${kickoff} .chip.project`), 'Aプロジェクト');
+  assert.ok((await page.innerText(`${kickoff} .meta`)).includes('☑ 0/2'), 'チェックリストも作られること');
+  // 同じ名前のプロジェクトは作れない
+  await page.click('#nav button:text-is("プロジェクト")');
+  await page.click('button:text-is("＋ プロジェクトを作成")');
+  await page.fill('#dlg input[type=text]', 'Aプロジェクト');
+  await page.click('#dlg button[type=submit]');
+  await page.waitForSelector('#toast:has-text("すでにあります")');
+  await closeDialog();
+  await page.click('#nav >> text=ボード');
+
+  // チケットテンプレートを選んで作ると、説明・ラベル・種別が入る
+  await page.click('#btnCreate');
+  await page.selectOption('#dlg select >> nth=0', { label: 'バグ報告' });
+  assert.strictEqual(await page.inputValue('#dlg input[type=text]'), '不具合: ');
+  assert.ok((await page.innerText('#dlg .tpl-note')).includes('ラベル(バグ, 要確認)'));
+  await page.fill('#dlg input[type=text]', '不具合: 保存できない');
+  await page.click('#dlg button[type=submit]');
+  await page.waitForSelector('.ticket-main');
+  assert.ok((await page.innerText('.ticket-main .desc-view')).includes('再現手順:'));
+  assert.strictEqual(await page.inputValue('.ticket-side input[type=text]'), 'バグ, 要確認');
+  assert.strictEqual(await page.inputValue('.ticket-side select >> nth=2'), 'バグ');
+  await closeDialog();
+
+  // サブチケットの表示: 普段は出さず、チェックを入れると親のキー付きで出る
+  await page.click(kickoff);
+  const kickoffKey = await page.textContent('#dlg .dlg-head .key');
+  await openSection('sub');
+  await page.fill('#dlg .sub-add input', 'キックオフの準備');
+  await page.press('#dlg .sub-add input', 'Enter');
+  await page.waitForSelector('#dlg .sub-list li:has-text("キックオフの準備")');
+  await closeDialog();
+  const subCard = '.card:has(.title:text-is("キックオフの準備"))';
+  assert.strictEqual(await page.locator(subCard).count(), 0, '普段はサブを出さない');
+  const subsCheck = '#filters label:has-text("サブチケットを表示") input';
+  await page.check(subsCheck);
+  assert.strictEqual(await page.textContent(`${subCard} .chip.parent`), `↳ ${kickoffKey}`);
+  // 「クリア」は絞り込みだけを外し、サブの表示は残す
+  await page.click('#filterState >> text=クリア');
+  assert.ok(await page.isChecked(subsCheck), 'クリアしてもサブの表示は残すこと');
+  assert.strictEqual(await page.locator(subCard).count(), 1);
+  await page.click('#nav >> text=リスト');
+  assert.strictEqual(await page.locator('#main tbody tr:has-text("キックオフの準備") .chip.parent').count(), 1, 'リストにも出すこと');
+  // 親のキーを押すと親が開く
+  await page.click('#main tbody tr:has-text("キックオフの準備") .chip.parent .keylink');
+  await page.waitForSelector(`#dlg .dlg-head .key:text-is("${kickoffKey}")`);
+  await closeDialog();
+  await page.uncheck(subsCheck);
+  assert.strictEqual(await page.locator('#main tbody tr:has-text("キックオフの準備")').count(), 0);
+  await page.click('#nav >> text=ボード');
+
+  // テンプレートの削除で templates フォルダからファイルが消える
+  await page.click('#nav >> text=設定');
+  await page.click('#templatePanel [data-kind=ticket] li:has-text("バグ報告") button:text-is("削除")');
+  await page.waitForSelector('#toast:has-text("テンプレート「バグ報告」を削除しました")');
+  const tplFiles = await page.evaluate(async () => {
+    const db = await new Promise((res, rej) => { const r = indexedDB.open('ticket-board', 2); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+    const keys = await new Promise((res, rej) => { const r = db.transaction('demo').objectStore('demo').getAllKeys(IDBKeyRange.bound('/templates/', '/templates/￿')); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+    return keys.filter((k) => k.endsWith('.json')).length;
+  });
+  assert.strictEqual(tplFiles, 1, 'プロジェクトテンプレートだけが残ること');
+  // すでにあるプロジェクトでも、テンプレートを選べば(確認のうえ)チケットだけを追加できる
+  await page.click('#nav button:text-is("プロジェクト")');
+  await page.click('button:text-is("＋ プロジェクトを作成")');
+  await page.fill('#dlg input[type=text]', 'Aプロジェクト');
+  await page.selectOption('#dlg select', { index: 1 });
+  await page.click('#dlg button[type=submit]');
+  await page.waitForSelector('#toast:has-text("プロジェクト「Aプロジェクト」にチケット 2 件を追加しました")');
+  assert.ok(dialogs.at(-1).includes('チケット 2 件だけを追加しますか'), `確認の文言: ${dialogs.at(-1)}`);
+  assert.strictEqual(await page.locator('.card:has(.title:text-is("キックオフ"))').count(), 2);
+
+  // プロジェクト画面: 進み具合が出て、名前を押すとそのプロジェクトのボードが開く
+  await page.click('#nav button:text-is("プロジェクト")');
+  const pjRow = (name) => `#main tr[data-project="${name}"]`;
+  assert.ok((await page.innerText(pjRow('Aプロジェクト'))).includes('完了 0 /'), '進み具合が出ること');
+  // 名前の変更: 付いているチケットのプロジェクトも書き換える
+  await page.click(`${pjRow('Web')} button:text-is("編集")`);
+  await page.fill('#dlg input[type=text]', 'Webサイト');
+  await page.fill('#dlg input[type=date]', '2020-01-01');
+  await page.click('#dlg button[type=submit]');
+  await page.waitForSelector('#toast:has-text("のプロジェクトを書き換えました")');
+  assert.ok(dialogs.at(-1).includes('「Web」から「Webサイト」'), `確認の文言: ${dialogs.at(-1)}`);
+  assert.strictEqual(await page.locator(`${pjRow('Webサイト')} .due.over`).count(), 1, '期限切れを強調すること');
+  await page.click(`${pjRow('Webサイト')} .project-link`);
+  await page.waitForSelector('.board');
+  assert.strictEqual(await page.inputValue(projectFilter.replace('"Web"', '"Webサイト"')), 'Webサイト');
+  assert.ok(await page.locator('.card').count() > 0, '名前を変えたプロジェクトのチケットが出ること');
+  assert.strictEqual(await page.locator('.card .chip.project:text-is("Web")').count(), 0);
+  // チケットが付いているプロジェクトは削除できない
+  await page.click('#nav button:text-is("プロジェクト")');
+  await page.click(`${pjRow('Webサイト')} button:text-is("編集")`);
+  await page.click('#dlg button:text-is("削除")');
+  await page.waitForSelector('#toast:has-text("先にチケットのプロジェクトを付け替えてください")');
+  await closeDialog();
+  // ステータスを「完了」にすると、プロジェクト一覧・ボード・選択肢から消える
+  await page.selectOption(`${pjRow('Aプロジェクト')} select`, '完了');
+  await page.waitForSelector('#toast:has-text("ボード・リストに出なくなります")');
+  assert.strictEqual(await page.locator(pjRow('Aプロジェクト')).count(), 0, '完了したプロジェクトは一覧に出さない');
+  await page.check('#main label:has-text("完了したプロジェクトも表示") input');
+  assert.strictEqual(await page.locator(pjRow('Aプロジェクト')).count(), 1, 'チェックを入れると出す');
+  await page.click('#nav >> text=ボード');
+  await page.selectOption('#filters select:has(option[value="Webサイト"])', '');
+  assert.strictEqual(await page.locator('.card .chip.project:text-is("Aプロジェクト")').count(), 0, '完了したプロジェクトのチケットはボードに出さない');
+  assert.strictEqual(await page.locator('#filters option[value="Aプロジェクト"]').count(), 0, '絞り込みの選択肢から外すこと');
+  await page.click('#btnCreate');
+  assert.strictEqual(await page.locator('#dlg option[value="Aプロジェクト"]').count(), 0, 'チケット作成の選択肢から外すこと');
+  await closeDialog();
+  // プロジェクト画面から開けば(絞り込めば)チケットが出る
+  await page.click('#nav button:text-is("プロジェクト")');
+  await page.click(`${pjRow('Aプロジェクト')} .project-link`);
+  await page.waitForSelector('.card .chip.project:text-is("Aプロジェクト")');
+  // チケットが無いプロジェクトは削除できる
+  await page.click('#nav button:text-is("プロジェクト")');
+  await page.click(`${pjRow('アプリ')} button:text-is("編集")`);
+  await page.click('#dlg button:text-is("削除")');
+  await page.waitForSelector('#toast:has-text("プロジェクト「アプリ」を削除しました")');
+  assert.strictEqual(await page.locator(pjRow('アプリ')).count(), 0);
+  // 設定画面の保存で、プロジェクトの情報が消えないこと
+  await page.click('#nav >> text=設定');
+  await page.click('.panel >> text=保存 >> nth=0');
+  await page.waitForSelector('#toast:has-text("設定を保存しました")');
+  await page.click('#nav button:text-is("プロジェクト")');
+  assert.strictEqual(await page.locator(pjRow('Webサイト')).count(), 1);
+  assert.strictEqual(await page.inputValue(`${pjRow('Aプロジェクト')} select`), '完了', '設定を保存してもプロジェクトのステータスが残ること');
+  // 完了扱いのステータス(最後の行)の名前を変えたら、完了済みのプロジェクトを読み替える
+  await page.click('#nav >> text=設定');
+  await page.fill('.panel textarea >> nth=2', '計画中\n進行中\n保留\n終了');
+  await page.click('.panel >> text=保存 >> nth=0');
+  await page.waitForSelector('#toast:has-text("設定を保存しました")');
+  assert.ok(dialogs.at(-1).includes('「完了」から「終了」'), `確認の文言: ${dialogs.at(-1)}`);
+  await page.click('#nav button:text-is("プロジェクト")');
+  assert.strictEqual(await page.inputValue(`${pjRow('Aプロジェクト')} select`), '終了', '完了済みのプロジェクトを読み替えること');
+  // プロジェクト名に __proto__ は使えない
+  await page.click('button:text-is("＋ プロジェクトを作成")');
+  await page.fill('#dlg input[type=text]', '__proto__');
+  await page.click('#dlg button[type=submit]');
+  await page.waitForSelector('#toast:has-text("「__proto__」はプロジェクト名に使えません")');
+  await closeDialog();
 
   assert.deepStrictEqual(errors, [], 'ブラウザのエラーがないこと');
   await browser.close();

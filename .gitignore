@@ -4,6 +4,7 @@
 /attachments/
 /users/
 /logs/
+/templates/
 *.crswap
 
 node_modules/

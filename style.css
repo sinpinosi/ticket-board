@@ -336,3 +336,52 @@ kbd {
   display: inline-block; padding: 1px 6px; border: 1px solid var(--border); border-bottom-width: 2px;
   border-radius: 4px; font-family: inherit; font-size: 12px; background: var(--surface-2); white-space: nowrap;
 }
+
+/* ---------- テンプレート ---------- */
+.tpl-list { margin-bottom: 6px; }
+.tpl-list .name .note { white-space: nowrap; }
+.tpl-items { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+.tpl-item { border: 1px solid var(--border); border-radius: 8px; padding: 4px 12px 12px; background: color-mix(in srgb, var(--surface-2) 35%, transparent); }
+.tpl-item-head { display: flex; align-items: center; gap: 6px; padding-top: 6px; }
+.tpl-item-head .spacer { flex: 1; }
+.tpl-item textarea { min-height: 60px; }
+.btn:disabled { opacity: .4; cursor: default; }
+.btn:disabled:hover { background: var(--surface); }
+.tpl-preview ol { margin: 4px 0 0; padding-left: 1.6em; }
+.tpl-note:empty { display: none; }
+.tpl-note { margin-top: 4px; }
+
+/* ---------- サブチケットの親(サブチケットを表示しているとき) ---------- */
+.chip.parent { background: color-mix(in srgb, var(--accent) 10%, transparent); color: var(--muted); }
+.chip.parent .keylink { font-size: 11px; text-decoration: none; }
+.chip.parent .keylink:hover { text-decoration: underline; }
+td .chip.parent { margin-right: 6px; vertical-align: 1px; }
+
+/* ---------- 詳細: 編集できる場所のペンマーク ---------- */
+.edit-pen { color: var(--muted); opacity: .85; line-height: 0; display: inline-flex; }
+.title-wrap { position: relative; }
+.title-wrap .title-input { padding-right: 34px !important; }
+.title-wrap .edit-pen {
+  position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+  border: 0; background: none; cursor: pointer; padding: 4px 6px; border-radius: 4px;
+}
+.title-wrap:hover .edit-pen, .title-input:focus + .edit-pen { opacity: 1; color: var(--accent); }
+.desc-view { position: relative; padding-right: 30px; }
+.desc-view .edit-pen { position: absolute; right: 8px; top: 9px; pointer-events: none; }
+.desc-view:hover .edit-pen, .desc-view:focus .edit-pen { opacity: 1; color: var(--accent); }
+
+/* ---------- プロジェクト画面 ---------- */
+.toolbar .spacer { flex: 1; }
+.inline-check { display: flex; align-items: center; gap: 6px; margin: 0; font-size: 13px; color: var(--text); cursor: pointer; }
+.project-table td { vertical-align: middle; }
+.project-link {
+  border: 0; background: none; padding: 0; cursor: pointer; font: inherit; font-weight: 600;
+  color: var(--accent); text-align: left;
+}
+.project-link:hover { text-decoration: underline; }
+.project-status { width: auto; padding: 2px 6px; font-size: 13px; }
+.project-done .project-link, .project-done .project-desc { color: var(--muted); }
+.progress { display: inline-block; width: 110px; height: 8px; border-radius: 4px; background: var(--surface-2); overflow: hidden; vertical-align: middle; margin-right: 8px; }
+.progress-bar { height: 100%; background: var(--accent); }
+.progress-bar.ok { background: var(--ok); }
+.project-desc { min-width: 12em; max-width: 28em; color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

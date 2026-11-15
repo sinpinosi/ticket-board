@@ -24,6 +24,9 @@ const DEFAULT_CONFIG = {
   types: ['タスク', 'バグ', '要望', '問い合わせ'],
   priorities: ['高', '中', '低'],
   projects: [],
+  // プロジェクトのステータス(最後が「完了」扱い)と、プロジェクトごとの情報 {名前: {status, description, due}}
+  projectStatuses: ['計画中', '進行中', '保留', '完了'],
+  projectInfo: {},
 };
 const POLL_MS = 20000;
 const FIELD_LABELS = {
@@ -50,12 +53,18 @@ const ACTION_LABELS = {
   'ticket.renumber': 'キー振り直し',
   'data.export': 'バックアップ保存',
   'data.import': 'バックアップ読み込み',
+  'template.update': 'テンプレート保存',
+  'template.remove': 'テンプレート削除',
+  'project.create': 'プロジェクト作成',
+  'project.update': 'プロジェクト変更',
+  'project.remove': 'プロジェクト削除',
 };
+const TEMPLATE_KINDS = { project: 'プロジェクトテンプレート', ticket: 'チケットテンプレート' };
 /** 関連の種類(parent は別項目で持つ) */
 const REL_TYPES = ['blocks', 'relates'];
 const UI_KEY = 'tb.ui';
 const SEEN_KEY = 'tb.seen';
-const VIEWS = [['board', 'ボード'], ['list', 'リスト'], ['activity', '操作ログ'], ['members', 'メンバー'], ['settings', '設定']];
+const VIEWS = [['board', 'ボード'], ['list', 'リスト'], ['projects', 'プロジェクト'], ['activity', '操作ログ'], ['members', 'メンバー'], ['settings', '設定']];
 const INLINE_TYPES = /^(image\/(png|jpeg|gif|webp|bmp)|application\/pdf|text\/plain)$/;
 
 const state = {
@@ -66,8 +75,11 @@ const state = {
   tickets: new Map(),
   fileMeta: new Map(),
   users: new Map(),
+  /** テンプレート(templates/<id>.json)。id → テンプレート */
+  templates: new Map(),
   view: 'board',
-  filters: { q: '', project: '', assignee: '', type: '', priority: '', label: '', mine: false, unread: false, archived: false },
+  // subs は「サブチケットを表示」。絞り込みではなく表示の切り替えなので FILTER_DEFAULTS には入れない
+  filters: { q: '', project: '', assignee: '', type: '', priority: '', label: '', mine: false, unread: false, archived: false, subs: false },
   seen: {},
   seenKey: '',
   sort: { col: 'updatedAt', dir: -1 },
@@ -156,6 +168,19 @@ function resolveKey(key) {
   if (!live.length) { toast(`${key} はアーカイブ済みです。アーカイブから戻してから指定してください`, true); return null; }
   if (live.length > 1) { toast(`${key} というキーのチケットが ${live.length} 件あります。番号の重複が直るまで待ってから指定してください`, true); return null; }
   return live[0];
+}
+
+/** 編集できる場所に出すペンのアイコン(SVG。文字の ✎ はフォントによって細く小さく見えるため) */
+function penIcon() {
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  for (const [k, v] of Object.entries({ viewBox: '0 0 24 24', width: 16, height: 16, fill: 'none', stroke: 'currentColor', 'stroke-width': 2, 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true' })) svg.setAttribute(k, v);
+  for (const d of ['M12 20h9', 'M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z']) {
+    const path = document.createElementNS(NS, 'path');
+    path.setAttribute('d', d);
+    svg.append(path);
+  }
+  return svg;
 }
 
 function keyLink(t, label) {
@@ -524,6 +549,70 @@ async function loadUsers() {
   state.users = map;
 }
 
+/* ================= テンプレート ================= */
+
+/*
+ * templates/<id>.json に1テンプレート1ファイルで持つ(config.json に入れると、設定画面の保存で消えるため)。
+ *   kind: 'project' … プロジェクト作成時に、tickets をまとめて作る
+ *   kind: 'ticket'  … チケット作成時に選ぶ。tickets は1件だけ
+ * テンプレ内のチケットは普通のチケットの中身(タイトル・種別・優先度・説明・ラベル・チェックリスト)だけを持つ。
+ */
+const TEMPLATE_MAX_TICKETS = 100;
+const str = (v, max) => (v == null ? '' : String(v)).slice(0, max);
+function normalizeTemplateItem(x) {
+  const o = x && typeof x === 'object' ? x : {};
+  return {
+    // 末尾の空白は残す(チケットテンプレートの「不具合: 」のように、続きを書く前提の書き出しがあるため)
+    title: str(o.title, 200),
+    type: str(o.type, 100),
+    priority: str(o.priority, 100),
+    description: str(o.description, 100000),
+    // 共有フォルダのデータなので件数も絞る(巨大なファイルでチケットを大量に作らないように)
+    labels: Array.isArray(o.labels) ? [...new Set(o.labels.slice(0, 50).map((l) => str(l, 100).trim()).filter(Boolean))] : [],
+    checklist: Array.isArray(o.checklist) ? o.checklist.slice(0, 100).map((c) => str(c, 200).trim()).filter(Boolean) : [],
+  };
+}
+function normalizeTemplate(t, id) {
+  const kind = t.kind === 'ticket' ? 'ticket' : 'project';
+  let tickets = Array.isArray(t.tickets) ? t.tickets.slice(0, TEMPLATE_MAX_TICKETS).map(normalizeTemplateItem) : [];
+  if (kind === 'ticket') tickets = [tickets[0] || normalizeTemplateItem({})];
+  return {
+    id, kind, tickets,
+    name: str(t.name, 100).trim() || '(名前なし)',
+    updatedAt: str(t.updatedAt, 40), updatedBy: str(t.updatedBy, 200),
+  };
+}
+/** テンプレートを名前順に返す */
+function templatesOf(kind) {
+  return [...state.templates.values()].filter((t) => t.kind === kind).sort((a, b) => a.name.localeCompare(b.name, 'ja'));
+}
+async function loadTemplates() {
+  const map = new Map();
+  for await (const [name, handle] of state.dirs.templates.entries()) {
+    if (handle.kind !== 'file' || !name.endsWith('.json')) continue;
+    try {
+      const t = JSON.parse(await (await handle.getFile()).text());
+      if (!t || typeof t !== 'object') continue;
+      const id = name.slice(0, -5);
+      map.set(id, normalizeTemplate(t, id));
+    } catch { /* 同期途中で壊れて見えるファイルは次回の読み込みに回す */ }
+  }
+  state.templates = map;
+}
+async function saveTemplate(tpl) {
+  const id = tpl.id || `tp-${uid(8)}`;
+  const data = normalizeTemplate({ ...tpl, updatedAt: nowIso(), updatedBy: state.me.id }, id);
+  await writeJson(state.dirs.templates, id + '.json', data);
+  state.templates.set(id, data);
+  log('template.update', '', `${TEMPLATE_KINDS[data.kind]}「${data.name}」`);
+  return data;
+}
+async function removeTemplate(tpl) {
+  try { await state.dirs.templates.removeEntry(tpl.id + '.json'); } catch (e) { if (e.name !== 'NotFoundError') throw e; }
+  state.templates.delete(tpl.id);
+  log('template.remove', '', `${TEMPLATE_KINDS[tpl.kind]}「${tpl.name}」`);
+}
+
 async function loadConfig() {
   const c = await readJson(state.root, 'config.json');
   if (!c) return false;
@@ -536,8 +625,61 @@ async function loadConfig() {
     priorities: list(c.priorities, DEFAULT_CONFIG.priorities),
     // プロジェクトは0件でもよい(既定値で埋めない)
     projects: Array.isArray(c.projects) ? [...new Set(c.projects.map((v) => String(v).trim()).filter(Boolean))] : [],
+    projectStatuses: list(c.projectStatuses, DEFAULT_CONFIG.projectStatuses),
+    projectInfo: normalizeProjectInfo(c.projectInfo),
   };
   return true;
+}
+
+/* ================= プロジェクト ================= */
+
+/*
+ * プロジェクトは config.json の projects(名前の配列。以前の版との互換のためそのまま)と、
+ * projectInfo({名前: {status, description, due}})で持つ。チケットは名前で参照する。
+ * ステータスは projectStatuses の最後が「完了」。完了したプロジェクトのチケットはボード・リストに出さない。
+ */
+const DUE_RE = /^\d{4}-\d{2}-\d{2}$/;
+function normalizeProjectInfo(v) {
+  const out = {};
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return out;
+  for (const [k, x] of Object.entries(v)) {
+    if (k === '__proto__' || !x || typeof x !== 'object') continue;
+    out[k] = { status: str(x.status, 100), description: str(x.description, 10000), due: DUE_RE.test(String(x.due || '')) ? String(x.due) : '' };
+  }
+  return out;
+}
+/** プロジェクトの情報(登録が無ければ既定値) */
+function projectInfo(name) {
+  const c = state.config;
+  const i = Object.hasOwn(c.projectInfo, name) ? c.projectInfo[name] : {};
+  return { status: i.status || c.projectStatuses[0], description: i.description || '', due: i.due || '' };
+}
+/** プロジェクト名に使えない値(__none は絞り込みの「プロジェクトなし」、__proto__ は projectInfo のキーにできない) */
+const isReservedProjectName = (n) => n === '__none' || n === '__proto__';
+const isProjectDone = (name) => !!name && state.config.projects.includes(name) && projectInfo(name).status === state.config.projectStatuses.at(-1);
+/** 選択肢に出すプロジェクト(完了したものは除く。すでに付いている値は select() が残す) */
+const activeProjects = () => state.config.projects.filter((p) => !isProjectDone(p));
+
+/** config.json を書く直前に読み直してから mutate を当てる(他の人の設定変更を潰さない) */
+async function updateConfig(mutate) {
+  await loadConfig();
+  const next = structuredClone(state.config);
+  mutate(next);
+  await writeJson(state.root, 'config.json', next);
+  state.config = next;
+  return next;
+}
+
+/** プロジェクトのチケット(アーカイブ済みは除く)の集計 */
+function projectStats(name) {
+  let total = 0, done = 0, overdue = 0;
+  for (const t of state.tickets.values()) {
+    if (t.archived || t.project !== name) continue;
+    total++;
+    if (isDone(t)) done++;
+    else if (isOverdue(t)) overdue++;
+  }
+  return { total, done, overdue };
 }
 
 async function registerUser() {
@@ -557,10 +699,11 @@ async function refresh(force) {
   let changed = await withLock(syncTicketsRaw);
   // 振り直しに失敗しても(読み取り専用のフォルダなど)、他の人の更新の反映は止めない
   try { if (await fixDuplicateKeys()) changed = true; } catch (e) { console.warn('キーの振り直しに失敗', e); }
-  const before = JSON.stringify([state.config, [...state.users]]);
+  const before = JSON.stringify([state.config, [...state.users], [...state.templates]]);
   await loadConfig();
   await loadUsers();
-  const metaChanged = before !== JSON.stringify([state.config, [...state.users]]);
+  await loadTemplates();
+  const metaChanged = before !== JSON.stringify([state.config, [...state.users], [...state.templates]]);
   $('syncTime').textContent = new Date().toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   if (metaChanged) renderChrome();
   if (changed || metaChanged || force) {
@@ -575,29 +718,50 @@ async function refresh(force) {
 
 /* ================= チケット操作 ================= */
 
-async function createTicket({ title, type, priority, assignee, project = '', parent = '' }) {
+async function createTicket(item) {
+  return (await createTickets([item]))[0];
+}
+
+/**
+ * チケットをまとめて作る(テンプレートからの作成用)。ディレクトリの読み直しは最初の1回だけで、番号は続き番号にする。
+ * item: { title, type, priority, assignee, project, parent, description, labels, checklist(文字列の配列) }
+ * 途中で失敗したら、作れた件数をエラーの文に含める(作れたものは消さない)。
+ */
+async function createTickets(items) {
   const me = state.me;
-  const t = await withLock(async () => {
-    await syncTicketsRaw();
-    if (parent && !state.tickets.has(parent)) throw new Error(notFoundMsg('親チケット'));
-    const num = maxNum() + 1;
-    const key = `${state.config.key}-${num}`;
-    // 同時作成で番号が重複してもファイルが上書きされないよう、ランダムな接尾辞を付ける
-    const id = `${safeName(key)}-${uid(4)}`;
-    const now = nowIso();
-    const ticket = {
-      id, key, num, title, description: '',
-      type, status: state.config.statuses[0], priority, assignee, project,
-      reporter: me.id, due: '', labels: [], links: [], comments: [], history: [],
-      checklist: [], relations: [], parent,
-      archived: false, createdAt: now, updatedAt: now, updatedBy: me.id,
-    };
-    await writeJson(state.dirs.tickets, id + '.json', ticket);
-    state.tickets.set(id, normalizeTicket(ticket, id));
-    return ticket;
-  });
-  log('ticket.create', t.key, t.title);
-  return t;
+  const created = [];
+  try {
+    await withLock(async () => {
+      await syncTicketsRaw();
+      let num = maxNum();
+      for (const it of items) {
+        const parent = it.parent || '';
+        if (parent && !state.tickets.has(parent)) throw new Error(notFoundMsg('親チケット'));
+        num++;
+        const key = `${state.config.key}-${num}`;
+        // 同時作成で番号が重複してもファイルが上書きされないよう、ランダムな接尾辞を付ける
+        const id = `${safeName(key)}-${uid(4)}`;
+        const now = nowIso();
+        const ticket = {
+          id, key, num, title: it.title, description: it.description || '',
+          type: it.type, status: state.config.statuses[0], priority: it.priority, assignee: it.assignee || '', project: it.project || '',
+          reporter: me.id, due: '', labels: [...(it.labels || [])], links: [], comments: [], history: [],
+          checklist: (it.checklist || []).map((text) => ({ id: uid(6), text, done: false, by: me.id, at: now })),
+          relations: [], parent,
+          archived: false, createdAt: now, updatedAt: now, updatedBy: me.id,
+        };
+        await writeJson(state.dirs.tickets, id + '.json', ticket);
+        state.tickets.set(id, normalizeTicket(ticket, id));
+        created.push(ticket);
+      }
+    });
+  } catch (e) {
+    if (created.length && items.length > 1) throw new Error(`${items.length} 件中 ${created.length} 件を作成したところで失敗しました: ${e && e.message ? e.message : e}`);
+    throw e;
+  } finally {
+    for (const t of created) log('ticket.create', t.key, t.title);
+  }
+  return created;
 }
 
 const ticketLabel = (id) => { const t = state.tickets.get(id); return t ? t.key : 'チケット'; };
@@ -943,7 +1107,8 @@ function markSeen(t) {
 
 /** ヘッダーの 🔔 とタブのタイトルを更新する */
 function renderUnread() {
-  const n = [...state.tickets.values()].filter(isUnread).length;
+  // 完了したプロジェクトのチケットはボード・リストに出ないので数えない(押しても何も出ないのを防ぐ)
+  const n = [...state.tickets.values()].filter((t) => isUnread(t) && !isProjectDone(t.project)).length;
   const btn = $('btnUnread');
   btn.hidden = n === 0;
   btn.textContent = `🔔 ${n}`;
@@ -1179,7 +1344,7 @@ function renderFilters() {
   const f = state.filters;
   const on = (key, prop = 'value') => (e) => { f[key] = e.target[prop]; renderMain(); };
   const users = [...state.users.values()].sort((a, b) => String(a.name).localeCompare(String(b.name), 'ja'));
-  const projects = state.config.projects;
+  const projects = activeProjects();
   bar.replaceChildren(...[
     h('input', { type: 'search', placeholder: 'キー・タイトル・説明・ラベル・コメントで検索', value: f.q, oninput: on('q') }),
     // プロジェクトが1つもなければ出さない(記憶していた値が残っていても、select() が選択肢に残すので戻せる)
@@ -1193,6 +1358,8 @@ function renderFilters() {
     h('label', { class: 'check', title: '自分に関係するチケットのうち、他の人が更新して未読のもの' },
       h('input', { type: 'checkbox', checked: f.unread, onchange: on('unread', 'checked') }), '新着のみ'),
     h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: f.archived, onchange: on('archived', 'checked') }), 'アーカイブを表示'),
+    h('label', { class: 'check', title: '親チケットの中にしまわれているサブチケットも、通常のチケットと同じように並べる' },
+      h('input', { type: 'checkbox', checked: f.subs, onchange: on('subs', 'checked') }), 'サブチケットを表示'),
     h('span', { class: 'filter-state', id: 'filterState' }),
     h('span', { class: 'count', id: 'count' }),
   ].filter(Boolean));
@@ -1204,7 +1371,8 @@ const FILTER_DEFAULTS = () => ({ q: '', project: '', assignee: '', type: '', pri
 const isFiltering = () => Object.entries(FILTER_DEFAULTS()).some(([k, v]) => (k === 'q' ? state.filters.q.trim() : state.filters[k]) !== v);
 
 function clearFilters() {
-  state.filters = FILTER_DEFAULTS();
+  // 「サブチケットを表示」は表示の切り替えなので残す
+  state.filters = { ...FILTER_DEFAULTS(), subs: state.filters.subs };
   renderFilters();
   renderMain();
 }
@@ -1249,7 +1417,9 @@ function visibleTickets() {
   const q = f.q.trim().toLowerCase();
   return [...state.tickets.values()].filter((t) => {
     if (!!t.archived !== f.archived) return false;
-    if (isSubHidden(t)) return false;
+    if (!f.subs && isSubHidden(t)) return false;
+    // 完了したプロジェクトのチケットは出さない(そのプロジェクトで絞り込んだときは出す)
+    if (!f.project && isProjectDone(t.project)) return false;
     if (f.project === '__none' ? !!t.project : f.project && t.project !== f.project) return false;
     if (f.mine && t.assignee !== state.me.id) return false;
     if (f.unread && !hasUnread(t)) return false;
@@ -1265,6 +1435,15 @@ function visibleTickets() {
 /** 自分か、一覧に出ないサブチケットに新着があるか */
 const hasUnread = (t) => isUnread(t) || relIndex().unreadKids.has(t.id);
 const projectChip = (t) => (t.project ? h('span', { class: 'chip project', title: 'プロジェクト' }, t.project) : null);
+/** サブチケットの親(「↳ TK-3」)。押すと親を開く。親が見つからないものは出さない */
+function parentChip(t) {
+  const p = t.parent && t.parent !== t.id ? state.tickets.get(t.parent) : null;
+  if (!p) return null;
+  return h('span', { class: 'chip parent', title: `親チケット: ${p.key} ${p.title}` }, '↳ ', h('button', {
+    type: 'button', class: 'keylink', title: `親チケット ${p.key}「${p.title}」を開く`,
+    onclick: (e) => { e.stopPropagation(); openTicket(p.id); },
+  }, p.key));
+}
 const prioIndex = (p) => { const i = state.config.priorities.indexOf(p); return i < 0 ? 99 : i; };
 const isDone = (t) => t.status === state.config.statuses[state.config.statuses.length - 1];
 const isOverdue = (t) => !!t.due && t.due < todayStr() && !isDone(t);
@@ -1312,7 +1491,7 @@ function renderMain() {
   relIndexCache = null;
   const main = $('main');
   const top = main.scrollTop;
-  const views = { board: viewBoard, list: viewList, activity: viewActivity, members: viewMembers, settings: viewSettings };
+  const views = { board: viewBoard, list: viewList, projects: viewProjects, activity: viewActivity, members: viewMembers, settings: viewSettings };
   main.replaceChildren(views[state.view]());
   main.scrollTop = top;
   syncFilterBar();
@@ -1359,6 +1538,7 @@ function card(t) {
     }, l))) : null,
     h('div', { class: 'meta' },
       h('span', { class: 'key' }, t.key),
+      parentChip(t),
       projectChip(t),
       t.type ? h('span', { class: 'chip type' }, t.type) : null,
       prioChip(t.priority),
@@ -1406,7 +1586,7 @@ function viewList() {
     h('thead', null, h('tr', null, cols.map(th))),
     h('tbody', null, tickets.map((t) => h('tr', { class: 'clickable' + (state.cursor === t.id ? ' cursor' : ''), 'data-id': t.id, onclick: () => openTicket(t.id) },
       h('td', { class: 'nowrap' }, h('span', { class: 'key' }, t.key)),
-      h('td', { class: 'wrap' }, unreadDot(t), t.title, ' ', progressBadges(t)),
+      h('td', { class: 'wrap' }, parentChip(t), unreadDot(t), t.title, ' ', progressBadges(t)),
       showProject ? h('td', { class: 'nowrap' }, t.project) : null,
       h('td', { class: 'nowrap' }, t.type),
       h('td', { class: 'nowrap' }, t.status),
@@ -1476,21 +1656,28 @@ function viewSettings() {
   const key = h('input', { type: 'text', value: c.key, maxLength: 10 });
   const statuses = h('textarea', { rows: 5, value: c.statuses.join('\n') });
   const types = h('textarea', { rows: 4, value: c.types.join('\n') });
-  const projects = h('textarea', { rows: 4, value: c.projects.join('\n'), placeholder: '例:\nWebサイト改修\n社内ツール' });
+  const projectStatuses = h('textarea', { rows: 4, value: c.projectStatuses.join('\n') });
   const lines = (el) => [...new Set(el.value.split('\n').map((s) => s.trim()).filter(Boolean))];
 
   const saveConfig = guard(async () => {
-    const next = {
+    const fields = {
       projectName: name.value.trim() || DEFAULT_CONFIG.projectName,
       key: (key.value.trim().toUpperCase().replace(/[^A-Z0-9]/g, '') || DEFAULT_CONFIG.key),
-      statuses: lines(statuses), types: lines(types), priorities: c.priorities, projects: lines(projects),
+      statuses: lines(statuses), types: lines(types), projectStatuses: lines(projectStatuses),
     };
-    // '__none' は絞り込みの「プロジェクトなし」に使う値なので名前にできない
-    if (next.projects.includes('__none')) { toast('「__none」はプロジェクト名に使えません', true); return; }
-    if (next.statuses.length < 2) { toast('ステータスは2つ以上必要です', true); return; }
-    if (!next.types.length) { toast('種別は1つ以上必要です', true); return; }
-    await writeJson(state.root, 'config.json', next);
-    state.config = next;
+    if (fields.statuses.length < 2) { toast('ステータスは2つ以上必要です', true); return; }
+    if (!fields.types.length) { toast('種別は1つ以上必要です', true); return; }
+    if (fields.projectStatuses.length < 2) { toast('プロジェクトのステータスは2つ以上必要です', true); return; }
+    // 最後の行(完了)の名前を変えると、完了済みのプロジェクトが黙って未完了に戻るので、読み替えるか確かめる
+    const oldDone = c.projectStatuses.at(-1);
+    const newDone = fields.projectStatuses.at(-1);
+    const doneNames = oldDone !== newDone ? c.projects.filter((p) => projectInfo(p).status === oldDone) : [];
+    const remap = doneNames.length > 0 && confirm(`完了扱いのステータスが「${oldDone}」から「${newDone}」に変わります。\n\n「${oldDone}」のプロジェクト ${doneNames.length} 件を「${newDone}」に読み替えますか?\n(キャンセルすると読み替えずに保存し、それらのプロジェクトは完了扱いではなくなります)`);
+    // プロジェクトの一覧・情報は別の画面で変えるので、読み直した値を残して、この画面の項目だけ差し替える
+    await updateConfig((next) => {
+      Object.assign(next, fields);
+      if (remap) for (const i of Object.values(next.projectInfo)) if (i.status === oldDone) i.status = newDone;
+    });
     log('config.update', '', 'プロジェクト設定を変更');
     renderChrome();
     renderMain();
@@ -1505,9 +1692,10 @@ function viewSettings() {
       h('label', null, 'チケットキーの接頭辞(変更後に作成するチケットから適用)'), key,
       h('label', null, 'ステータス(1行に1つ。左から順にボードの列になり、最後の行が「完了」扱い)'), statuses,
       h('label', null, '種別(1行に1つ)'), types,
-      h('label', null, 'プロジェクト(1行に1つ。チケットを分ける単位。空でもよい)'), projects,
-      h('div', { class: 'note' }, '名前を変えたり消したりしても、既存のチケットのプロジェクトは書き換わりません。チケットの詳細画面で付け替えてください。'),
+      h('label', null, 'プロジェクトのステータス(1行に1つ。最後の行が「完了」扱いで、完了したプロジェクトのチケットはボード・リストに出なくなります)'), projectStatuses,
+      h('div', { class: 'note' }, 'プロジェクトの作成・名前の変更は「プロジェクト」画面で行います。'),
       h('div', { class: 'toolbar' }, h('button', { class: 'btn primary', onclick: saveConfig }, '保存'))),
+    templatePanel(),
     h('div', { class: 'panel' },
       h('h2', null, 'プロフィール'),
       h('div', { class: 'note' }, 'このブラウザに保存され、操作ログに記録されます。'),
@@ -1563,7 +1751,7 @@ function backupPanel() {
   return h('div', { class: 'panel' },
     h('h2', null, 'データのバックアップ'),
     h('div', { class: 'note' },
-      'チケット・設定・メンバー・添付を1つのファイルに保存します(操作ログは含みません)。',
+      'チケット・設定・メンバー・添付を1つのファイルに保存します(操作ログとテンプレートは含みません)。',
       '読み込むと、今のデータにチケットを「追加」します。今あるチケットや設定は上書きしません。'),
     h('div', { class: 'note' }, 'お試しモードのデータをチームのフォルダに移すには: お試しモードで「保存」→「保存先フォルダを切り替える」でフォルダに接続 → ここで「読み込み」。'),
     h('label', { class: 'check' }, withAtt, '添付ファイルも含める ', stats),
@@ -1663,6 +1851,371 @@ function assigneeOptions() {
   return [['', '未割り当て'], ...users.map((u) => [u.id, u.name || u.id])];
 }
 
+/* ================= 設定: テンプレート ================= */
+
+const defaultPriority = () => state.config.priorities[Math.min(1, state.config.priorities.length - 1)];
+
+function templatePanel() {
+  const group = (kind) => {
+    const list = templatesOf(kind);
+    return [
+      h('div', { class: 'section-title' }, TEMPLATE_KINDS[kind], h('span', { class: 'spacer' }),
+        h('button', { class: 'btn small', type: 'button', onclick: () => openTemplateDialog({ kind }) }, '＋ 追加')),
+      list.length
+        ? h('ul', { class: 'link-list tpl-list', 'data-kind': kind }, list.map((tpl) => h('li', null,
+          h('span', { class: 'name' }, tpl.name, kind === 'project' ? h('span', { class: 'note' }, ` (チケット ${tpl.tickets.length} 件)`) : null),
+          h('button', { class: 'btn small', type: 'button', onclick: () => openTemplateDialog(tpl) }, '編集'),
+          h('button', {
+            class: 'btn small danger', type: 'button',
+            onclick: guard(async () => {
+              if (!confirm(`${TEMPLATE_KINDS[kind]}「${tpl.name}」を削除しますか?\n\nこのテンプレートから作ったチケットはそのまま残ります。`)) return;
+              await removeTemplate(tpl);
+              renderMain();
+              toast(`テンプレート「${tpl.name}」を削除しました`);
+            }),
+          }, '削除'))))
+        : h('div', { class: 'note' }, kind === 'project'
+          ? 'まだありません。プロジェクトを作るときに、決まったチケットをまとめて作れます。'
+          : 'まだありません。チケットを作るときに選ぶと、説明・ラベル・チェックリストが入ります。'),
+    ];
+  };
+  return h('div', { class: 'panel', id: 'templatePanel' },
+    h('h2', null, 'テンプレート'),
+    h('div', { class: 'note' }, '全メンバーに反映されます(共有フォルダの templates フォルダ)。同じテンプレートを2人が同時に編集すると、後から保存したほうが残ります。'),
+    group('project'),
+    group('ticket'));
+}
+
+/** テンプレートの編集ダイアログ。tpl に id が無ければ新規作成 */
+function openTemplateDialog(tpl) {
+  const c = state.config;
+  const kind = tpl.kind === 'ticket' ? 'ticket' : 'project';
+  const toEdit = (it) => ({
+    title: it.title || '', type: it.type || c.types[0], priority: it.priority || defaultPriority(),
+    labelsText: (it.labels || []).join(', '), description: it.description || '', checklistText: (it.checklist || []).join('\n'),
+  });
+  const items = (tpl.tickets && tpl.tickets.length ? tpl.tickets : [{}]).map(toEdit);
+  const name = h('input', { type: 'text', value: tpl.name || '', maxLength: 100, placeholder: kind === 'project' ? '例: 新規案件の立ち上げ' : '例: バグ報告' });
+  const list = h('div', { class: 'tpl-items' });
+  state.openId = null;
+  dlg.className = 'dlg';
+
+  const renderItems = () => {
+    list.replaceChildren(...items.map((it, i) => {
+      const bind = (field) => (e) => { it[field] = e.target.value; };
+      const move = (d) => () => { [items[i], items[i + d]] = [items[i + d], items[i]]; renderItems(); };
+      return h('div', { class: 'tpl-item' },
+        kind === 'project' ? h('div', { class: 'tpl-item-head' }, h('strong', null, `チケット ${i + 1}`), h('span', { class: 'spacer' }),
+          h('button', { class: 'btn small', type: 'button', title: '上へ', disabled: i === 0, onclick: move(-1) }, '↑'),
+          h('button', { class: 'btn small', type: 'button', title: '下へ', disabled: i === items.length - 1, onclick: move(1) }, '↓'),
+          h('button', {
+            class: 'btn small danger', type: 'button', disabled: items.length === 1,
+            onclick: () => { items.splice(i, 1); renderItems(); },
+          }, '削除')) : null,
+        h('label', null, 'タイトル'), h('input', { type: 'text', class: 'tpl-title', value: it.title, maxLength: 200, oninput: bind('title') }),
+        h('div', { class: 'row' },
+          h('div', null, h('label', null, '種別'), select(c.types, it.type, bind('type'))),
+          h('div', null, h('label', null, '優先度'), select(c.priorities, it.priority, bind('priority')))),
+        h('label', null, 'ラベル(カンマ区切り)'), h('input', { type: 'text', value: it.labelsText, oninput: bind('labelsText') }),
+        h('label', null, '説明'), h('textarea', { rows: 3, class: 'tpl-desc', value: it.description, oninput: bind('description') }),
+        h('label', null, 'チェックリスト(1行に1項目)'), h('textarea', { rows: 3, class: 'tpl-check', value: it.checklistText, oninput: bind('checklistText') }));
+    }));
+  };
+  renderItems();
+
+  const save = guard(async () => {
+    const n = name.value.trim();
+    if (!n) { toast('テンプレート名を入力してください', true); name.focus(); return; }
+    const empty = items.findIndex((it) => !it.title.trim());
+    if (empty >= 0) {
+      toast(kind === 'project' ? `チケット ${empty + 1} のタイトルを入力してください` : 'タイトルを入力してください', true);
+      list.querySelectorAll('.tpl-title')[empty].focus();
+      return;
+    }
+    const saved = await saveTemplate({
+      id: tpl.id, kind, name: n,
+      tickets: items.map((it) => ({
+        title: it.title, type: it.type, priority: it.priority, description: it.description,
+        labels: parseLabels(it.labelsText), checklist: it.checklistText.split('\n').map((s) => s.trim()).filter(Boolean),
+      })),
+    });
+    dlg.close();
+    renderMain();
+    toast(`テンプレート「${saved.name}」を保存しました`);
+  });
+
+  setDialog(h('div', { class: 'tpl-dialog' },
+    h('div', { class: 'dlg-head' }, h('strong', null, `${TEMPLATE_KINDS[kind]}${tpl.id ? 'の編集' : 'の作成'}`), h('span', { class: 'spacer' }),
+      h('button', { class: 'btn ghost', type: 'button', onclick: () => dlg.close() }, '✕')),
+    h('div', { class: 'dlg-body' },
+      h('label', null, 'テンプレート名'), name,
+      kind === 'project' ? h('div', { class: 'note' }, 'このテンプレートでプロジェクトを作ると、下のチケットが上から順に作られます(担当者・期限は空、ステータスは最初の列)。') : null,
+      list,
+      kind === 'project' ? h('div', { class: 'toolbar' }, h('button', {
+        class: 'btn', type: 'button',
+        onclick: () => {
+          if (items.length >= TEMPLATE_MAX_TICKETS) { toast(`チケットは ${TEMPLATE_MAX_TICKETS} 件までです`, true); return; }
+          items.push(toEdit({})); renderItems(); list.querySelectorAll('.tpl-title')[items.length - 1].focus(); },
+      }, '＋ チケットを追加')) : null,
+      h('div', { class: 'toolbar' }, h('button', { class: 'btn primary', type: 'button', onclick: save }, '保存')))));
+  if (!dlg.open) dlg.showModal();
+  name.focus();
+}
+
+/* ================= 画面: プロジェクト ================= */
+
+/** プロジェクト画面の表示状態(このブラウザの間だけ) */
+const projectUi = { showDone: false };
+
+/** プロジェクトで絞り込んだボードを開く(完了したプロジェクトでも、絞り込めばチケットが出る) */
+function openProjectBoard(name) {
+  state.filters = { ...state.filters, project: name };
+  state.view = 'board';
+  renderChrome();
+  renderMain();
+}
+
+async function setProjectStatus(name, status) {
+  const from = projectInfo(name).status;
+  if (from === status) return;
+  await updateConfig((c) => {
+    if (!c.projects.includes(name)) throw new Error(`プロジェクト「${name}」が見つかりません。他の人が名前を変えたか削除した可能性があります`);
+    c.projectInfo[name] = { description: '', due: '', ...(Object.hasOwn(c.projectInfo, name) ? c.projectInfo[name] : {}), status };
+  });
+  log('project.update', '', `${name}: ステータス ${from} → ${status}`);
+  renderChrome();
+  renderMain();
+  toast(status === state.config.projectStatuses.at(-1)
+    ? `プロジェクト「${name}」を${status}にしました。このプロジェクトのチケットはボード・リストに出なくなります`
+    : `プロジェクト「${name}」を${status}にしました`);
+}
+
+function viewProjects() {
+  const c = state.config;
+  const doneCount = c.projects.filter(isProjectDone).length;
+  // 完了していないもの → 完了したもの の順(それぞれは登録順)
+  const shown = [...c.projects.filter((p) => !isProjectDone(p)), ...(projectUi.showDone ? c.projects.filter(isProjectDone) : [])];
+  const toolbar = h('div', { class: 'toolbar' },
+    h('button', { class: 'btn primary', type: 'button', onclick: openProjectCreateDialog }, '＋ プロジェクトを作成'),
+    h('label', { class: 'check inline-check' }, h('input', {
+      type: 'checkbox', checked: projectUi.showDone,
+      onchange: (e) => { projectUi.showDone = e.target.checked; renderMain(); },
+    }), `完了したプロジェクトも表示(${doneCount} 件)`));
+  if (!shown.length) {
+    return h('div', { class: 'view-pad' }, toolbar, h('div', { class: 'table-wrap' }, h('div', { class: 'empty' },
+      c.projects.length ? '完了していないプロジェクトはありません' : 'プロジェクトはまだありません。「＋ プロジェクトを作成」から作れます')));
+  }
+  const today = todayStr();
+  return h('div', { class: 'view-pad' }, toolbar, h('div', { class: 'table-wrap' }, h('table', { class: 'project-table' },
+    h('thead', null, h('tr', null, ['プロジェクト', 'ステータス', '期限', '進み具合', '期限切れ', '説明', ''].map((x) => h('th', null, x)))),
+    h('tbody', null, shown.map((name) => {
+      const info = projectInfo(name);
+      const st = projectStats(name);
+      const done = isProjectDone(name);
+      const pct = st.total ? Math.round((st.done / st.total) * 100) : 0;
+      const over = !!info.due && info.due < today && !done;
+      return h('tr', { class: done ? 'project-done' : '', 'data-project': name },
+        h('td', { class: 'nowrap' }, h('button', {
+          type: 'button', class: 'project-link', title: `「${name}」のボードを開く`, onclick: () => openProjectBoard(name),
+        }, name)),
+        h('td', { class: 'nowrap' }, select(c.projectStatuses, info.status, guard(async (e) => {
+          try { await setProjectStatus(name, e.target.value); } catch (err) { renderMain(); throw err; }
+        }), { class: 'project-status', title: 'ステータス' })),
+        h('td', { class: 'nowrap' }, h('span', { class: 'due' + (over ? ' over' : ''), title: over ? '期限切れ' : null }, info.due || '')),
+        h('td', { class: 'nowrap' },
+          h('div', { class: 'progress', title: `${pct}%` }, h('div', { class: 'progress-bar' + (st.total && st.done === st.total ? ' ok' : ''), style: `width:${pct}%` })),
+          h('span', { class: 'note' }, st.total ? `完了 ${st.done} / ${st.total} 件` : 'チケットなし')),
+        h('td', { class: 'nowrap' }, st.overdue ? h('span', { class: 'due over' }, `${st.overdue} 件`) : ''),
+        h('td', { class: 'project-desc', title: info.description || null }, info.description),
+        h('td', { class: 'nowrap' }, h('button', { class: 'btn small', type: 'button', onclick: () => openProjectEditDialog(name) }, '編集')));
+    })))));
+}
+
+/** プロジェクトの名前・ステータス・期限・説明を変える。名前を変えたら、付いているチケットも書き換える */
+function openProjectEditDialog(oldName) {
+  const c = state.config;
+  const info = projectInfo(oldName);
+  const name = h('input', { type: 'text', value: oldName, maxLength: 100 });
+  const status = select(c.projectStatuses, info.status);
+  const due = h('input', { type: 'date', value: info.due });
+  const desc = h('textarea', { rows: 4, maxLength: 10000, value: info.description });
+  const usedBy = () => [...state.tickets.values()].filter((t) => t.project === oldName);
+  state.openId = null;
+  dlg.className = 'dlg narrow';
+
+  let busy = false;
+  const save = guard(async (e) => {
+    e.preventDefault();
+    if (busy) return;
+    const n = name.value.trim();
+    if (!n) { toast('プロジェクト名を入力してください', true); name.focus(); return; }
+    if (isReservedProjectName(n)) { toast(`「${n}」はプロジェクト名に使えません`, true); return; }
+    if (due.value && !DUE_RE.test(due.value)) { toast('期限の日付が正しくありません', true); return; }
+    const renamed = n !== oldName;
+    if (renamed && state.config.projects.includes(n)) { toast(`プロジェクト「${n}」はすでにあります`, true); return; }
+    busy = true;
+    try {
+      if (renamed) await withLock(syncTicketsRaw); // 付いているチケットを最新の状態で数える
+      const tickets = renamed ? usedBy() : [];
+      if (renamed && tickets.length && !confirm(`プロジェクト名を「${oldName}」から「${n}」に変えます。\n\nこのプロジェクトのチケット ${tickets.length} 件(アーカイブ済みを含む)のプロジェクトも書き換えます。よろしいですか?`)) return;
+      const nextInfo = { status: status.value, due: due.value, description: desc.value };
+      await updateConfig((cfg) => {
+        const i = cfg.projects.indexOf(oldName);
+        if (i < 0) throw new Error(`プロジェクト「${oldName}」が見つかりません。他の人が名前を変えたか削除した可能性があります`);
+        if (renamed && cfg.projects.includes(n)) throw new Error(`プロジェクト「${n}」はすでにあります`);
+        // 読み直した最新の情報に、このダイアログで変えた項目だけを当てる
+        const cur = { status: '', description: '', due: '', ...(Object.hasOwn(cfg.projectInfo, oldName) ? cfg.projectInfo[oldName] : {}) };
+        for (const k of ['status', 'due', 'description']) if (nextInfo[k] !== info[k]) cur[k] = nextInfo[k];
+        cfg.projects[i] = n;
+        delete cfg.projectInfo[oldName];
+        cfg.projectInfo[n] = cur;
+      });
+      const changes = [renamed ? `名前 ${oldName} → ${n}` : null, nextInfo.status !== info.status ? `ステータス ${info.status} → ${nextInfo.status}` : null,
+        nextInfo.due !== info.due ? `期限 ${info.due || '(なし)'} → ${nextInfo.due || '(なし)'}` : null, nextInfo.description !== info.description ? '説明を編集' : null].filter(Boolean);
+      if (changes.length) log('project.update', '', `${n}: ${changes.join('、')}`);
+      // チケットは1件ずつ updateTicket で書き換える(読み直した時点で別のプロジェクトに付け替えられていたら触らない)
+      const failed = [];
+      for (const t of tickets) {
+        try {
+          await updateTicket(t.id, (x) => {
+            if (x.project !== oldName) return;
+            x.project = n;
+            x.history.push({ at: nowIso(), by: state.me.id, field: 'project', from: oldName, to: n });
+          });
+          log('ticket.update', t.key, `${FIELD_LABELS.project}: ${oldName} → ${n}(プロジェクト名の変更)`);
+        } catch (err) {
+          console.error(err);
+          failed.push(t.key);
+        }
+      }
+      if (state.filters.project === oldName) state.filters = { ...state.filters, project: n };
+      dlg.close();
+      renderChrome();
+      renderMain();
+      if (failed.length) toast(`プロジェクトを保存しましたが、チケット ${failed.join(', ')} のプロジェクトを書き換えられませんでした。チケットの詳細画面で付け替えてください`, true);
+      else toast(renamed && tickets.length ? `プロジェクトを保存し、チケット ${tickets.length} 件のプロジェクトを書き換えました` : 'プロジェクトを保存しました');
+    } finally {
+      busy = false;
+    }
+  });
+
+  // 削除はチケットが1件も付いていないときだけ(付いているチケットが「一覧にないプロジェクト」になるのを防ぐ)
+  const remove = guard(async () => {
+    const used = usedBy();
+    if (used.length) { toast(`このプロジェクトにはチケットが ${used.length} 件あります(アーカイブ済みを含む)。削除するには、先にチケットのプロジェクトを付け替えてください。使わなくなったプロジェクトは、ステータスを「${c.projectStatuses.at(-1)}」にすると一覧から隠れます`, true); return; }
+    if (!confirm(`プロジェクト「${oldName}」を削除しますか?`)) return;
+    await updateConfig((cfg) => {
+      cfg.projects = cfg.projects.filter((p) => p !== oldName);
+      delete cfg.projectInfo[oldName];
+    });
+    log('project.remove', '', oldName);
+    if (state.filters.project === oldName) state.filters = { ...state.filters, project: '' };
+    dlg.close();
+    renderChrome();
+    renderMain();
+    toast(`プロジェクト「${oldName}」を削除しました`);
+  });
+
+  setDialog(h('form', { onsubmit: save },
+    h('div', { class: 'dlg-head' }, h('strong', null, 'プロジェクトの編集'), h('span', { class: 'spacer' }),
+      h('button', { class: 'btn ghost', type: 'button', onclick: () => dlg.close() }, '✕')),
+    h('div', { class: 'dlg-body' },
+      h('label', null, 'プロジェクト名'), name,
+      h('div', { class: 'note' }, '名前を変えると、このプロジェクトのチケットのプロジェクトも書き換えます。'),
+      h('label', null, 'ステータス'), status,
+      h('label', null, '期限'), due,
+      h('label', null, '説明'), desc,
+      h('div', { class: 'toolbar' },
+        h('button', { class: 'btn primary', type: 'submit' }, '保存'),
+        h('span', { class: 'spacer' }),
+        h('button', { class: 'btn danger', type: 'button', onclick: remove }, '削除')))));
+  if (!dlg.open) dlg.showModal();
+  name.focus();
+}
+
+/* ================= ダイアログ: プロジェクト作成 ================= */
+
+function openProjectCreateDialog() {
+  const name = h('input', { type: 'text', required: true, maxLength: 100, placeholder: '例: Webサイト改修' });
+  const due = h('input', { type: 'date' });
+  const desc = h('textarea', { rows: 3, maxLength: 10000, placeholder: '目的やゴールなど(任意)' });
+  const tpls = templatesOf('project');
+  const tplSel = select([['', '(テンプレートなし)'], ...tpls.map((t) => [t.id, `${t.name}(チケット ${t.tickets.length} 件)`])], '');
+  const preview = h('div', { class: 'tpl-preview' });
+  const showPreview = () => {
+    const tpl = state.templates.get(tplSel.value);
+    preview.replaceChildren(...(tpl && tpl.tickets.length
+      ? [h('div', { class: 'note' }, '作られるチケット:'), h('ol', null, tpl.tickets.map((it) => h('li', null, it.title || '(無題)')))]
+      : []));
+  };
+  tplSel.addEventListener('change', showPreview);
+  state.openId = null;
+  dlg.className = 'dlg narrow';
+
+  let busy = false;
+  const submit = guard(async (e) => {
+    e.preventDefault();
+    if (busy) return;
+    const n = name.value.trim();
+    if (!n) { toast('プロジェクト名を入力してください', true); name.focus(); return; }
+    if (isReservedProjectName(n)) { toast(`「${n}」はプロジェクト名に使えません`, true); return; }
+    if (due.value && !DUE_RE.test(due.value)) { toast('期限の日付が正しくありません', true); return; }
+    const tpl = tplSel.value ? state.templates.get(tplSel.value) : null;
+    if (tplSel.value && !tpl) { toast('選んだテンプレートが見つかりません。他の人が削除した可能性があります', true); return; }
+    busy = true;
+    try {
+      // 他の人が直前に変えた設定を上書きしないよう、書く直前に読み直す
+      await loadConfig();
+      // すでにあるプロジェクトには、テンプレートのチケットだけを足せる(途中で失敗したときの作り直しにも使う)
+      const exists = state.config.projects.includes(n);
+      if (exists && !(tpl && tpl.tickets.length)) { toast(`プロジェクト「${n}」はすでにあります`, true); return; }
+      if (exists && !confirm(`プロジェクト「${n}」はすでにあります。テンプレート「${tpl.name}」のチケット ${tpl.tickets.length} 件だけを追加しますか?`)) return;
+      if (!exists) {
+        const info = { status: state.config.projectStatuses[0], description: desc.value, due: due.value };
+        await updateConfig((c) => {
+          if (!c.projects.includes(n)) c.projects.push(n);
+          c.projectInfo[n] = info;
+        });
+      }
+      let created = [];
+      if (tpl && tpl.tickets.length) {
+        const c = state.config;
+        // 設定から消えた種別・優先度は既定値に戻す(チケット作成ダイアログと同じ扱い)
+        created = await createTickets(tpl.tickets.map((it) => ({
+          ...it, title: it.title.trim() || '(無題)', project: n,
+          type: c.types.includes(it.type) ? it.type : c.types[0],
+          priority: c.priorities.includes(it.priority) ? it.priority : defaultPriority(),
+        })));
+      }
+      if (!exists) log('project.create', '', tpl ? `${n}(テンプレート「${tpl.name}」・チケット ${created.length} 件)` : n);
+      // 作ったプロジェクトに絞り込んでボードを開く
+      state.filters = { ...state.filters, project: n };
+      state.view = 'board';
+      dlg.close();
+      renderChrome();
+      renderMain();
+      toast(exists ? `プロジェクト「${n}」にチケット ${created.length} 件を追加しました`
+        : created.length ? `プロジェクト「${n}」とチケット ${created.length} 件を作成しました` : `プロジェクト「${n}」を作成しました`);
+    } finally {
+      busy = false;
+    }
+  });
+
+  setDialog(h('form', { onsubmit: submit },
+    h('div', { class: 'dlg-head' }, h('strong', null, 'プロジェクト作成'), h('span', { class: 'spacer' }),
+      h('button', { class: 'btn ghost', type: 'button', onclick: () => dlg.close() }, '✕')),
+    h('div', { class: 'dlg-body' },
+      h('label', null, 'プロジェクト名'), name,
+      h('label', null, '期限(任意)'), due,
+      h('label', null, '説明(任意)'), desc,
+      h('label', null, 'テンプレート'), tplSel,
+      tpls.length ? null : h('div', { class: 'note' }, 'プロジェクトテンプレートは、設定画面の「テンプレート」で作れます。'),
+      preview,
+      h('div', { class: 'toolbar' }, h('button', { class: 'btn primary', type: 'submit' }, '作成')))));
+  if (!dlg.open) dlg.showModal();
+  name.focus();
+}
+
 /* ================= ダイアログ: チケット作成 ================= */
 
 function openCreateDialog() {
@@ -1673,11 +2226,32 @@ function openCreateDialog() {
   const assignee = select(assigneeOptions(), '');
   // 絞り込み中のプロジェクトがあれば、それを初期値にする(作った直後に一覧から消えないように)
   const pf = state.filters.project;
-  const project = select([['', '(なし)'], ...c.projects], pf && pf !== '__none' ? pf : '');
+  const project = select([['', '(なし)'], ...activeProjects()], pf && pf !== '__none' ? pf : '');
+  // チケットテンプレート: 選ぶとタイトル・種別・優先度を埋め、説明・ラベル・チェックリストは作成時に入れる
+  const tpls = templatesOf('ticket');
+  let tplItem = null;
+  const tplNote = h('div', { class: 'note tpl-note' });
+  const tplSel = tpls.length ? select([['', '(テンプレートなし)'], ...tpls.map((t) => [t.id, t.name])], '', () => {
+    const tpl = state.templates.get(tplSel.value);
+    tplItem = tpl ? tpl.tickets[0] : null;
+    if (tplItem) {
+      title.value = tplItem.title;
+      if (tplItem.type) type.value = c.types.includes(tplItem.type) ? tplItem.type : type.value;
+      if (tplItem.priority) prio.value = c.priorities.includes(tplItem.priority) ? tplItem.priority : prio.value;
+    }
+    const parts = tplItem ? [
+      tplItem.description ? '説明' : null,
+      tplItem.labels.length ? `ラベル(${tplItem.labels.join(', ')})` : null,
+      tplItem.checklist.length ? `チェックリスト ${tplItem.checklist.length} 項目` : null,
+    ].filter(Boolean) : [];
+    tplNote.textContent = parts.length ? `${parts.join('・')}はテンプレートから入ります` : '';
+    title.focus();
+  }) : null;
   state.openId = null;
   dlg.className = 'dlg narrow';
   const create = async (text) => {
-    const t = await createTicket({ title: text, type: type.value, priority: prio.value, assignee: assignee.value, project: project.value });
+    const extra = tplItem ? { description: tplItem.description, labels: tplItem.labels, checklist: tplItem.checklist } : {};
+    const t = await createTicket({ ...extra, title: text, type: type.value, priority: prio.value, assignee: assignee.value, project: project.value });
     renderMain();
     return t;
   };
@@ -1691,13 +2265,15 @@ function openCreateDialog() {
   const createAndContinue = guard(async () => {
     const text = takeTitle();
     if (!text) return;
-    title.value = '';
+    // テンプレートを選んでいれば、次のチケットもその書き出しから始める
+    const blank = tplItem ? tplItem.title : '';
+    title.value = blank;
     title.focus();
     try {
       const t = await create(text);
       toast(`${t.key}「${t.title}」を作成しました`);
     } catch (e) {
-      if (!title.value) title.value = text; // 失敗したら入力を戻す
+      if (title.value === blank) title.value = text; // 失敗したら入力を戻す
       throw e;
     }
   });
@@ -1712,12 +2288,13 @@ function openCreateDialog() {
     h('div', { class: 'dlg-head' }, h('strong', null, 'チケット作成'), h('span', { class: 'spacer' }),
       h('button', { class: 'btn ghost', type: 'button', onclick: () => dlg.close() }, '✕')),
     h('div', { class: 'dlg-body' },
+      tplSel ? [h('label', null, 'テンプレート'), tplSel, tplNote] : null,
       h('label', null, 'タイトル'), title,
       h('div', { class: 'row' },
         h('div', null, h('label', null, '種別'), type),
         h('div', null, h('label', null, '優先度'), prio)),
       h('label', null, '担当者'), assignee,
-      c.projects.length || project.value ? [h('label', null, 'プロジェクト'), project] : null,
+      activeProjects().length || project.value ? [h('label', null, 'プロジェクト'), project] : null,
       h('div', { class: 'toolbar' },
         h('button', { class: 'btn primary', type: 'submit' }, '作成'),
         h('button', { class: 'btn', type: 'button', title: '作成して、続けて次のチケットを入力する', onclick: createAndContinue }, '作成して続ける')))));
@@ -1980,7 +2557,7 @@ function renderTicketDialog() {
       class: 'desc-view pre' + (desc ? '' : ' empty'), tabIndex: 0, title: 'クリックで編集 (E)',
       onclick: (e) => { if (!e.target.closest('a, button')) startDescEdit(); },
       onkeydown: (e) => { if (e.key === 'Enter' && e.target === e.currentTarget) { e.preventDefault(); startDescEdit(); } },
-    }, desc ? linkify(desc) : '説明を追加…(クリックで編集)'),
+    }, h('span', { class: 'edit-pen', 'aria-hidden': 'true' }, penIcon()), desc ? linkify(desc) : '説明を追加…(クリックで編集)'),
     (() => {
       const refs = referencedTickets(desc, t.id);
       const missing = missingKeys(desc);
@@ -1988,7 +2565,7 @@ function renderTicketDialog() {
         refs.length ? [h('span', { class: 'note' }, '参照:'), refs.map((r) => keyLink(r, `${r.key} ${r.title}`))] : null,
         missing.length ? h('span', { class: 'warn', title: 'このキーのチケットはありません。キーの書き間違いか、削除された可能性があります' }, `⚠ 見つからないキー: ${missing.join(', ')}`) : null) : null;
     })(),
-  ];
+  ].filter(Boolean); // replaceChildren は null を「null」という文字にするので落とす
   // 保存後はダイアログ全体を描き直さず、この欄だけ差し替える(閉じるボタンなどを押した瞬間に要素が消えないように)
   const descEditor = () => {
     // data-draft があるので、編集中にダイアログが描き直されても書きかけは引き継がれる
@@ -2051,6 +2628,20 @@ function renderTicketDialog() {
     renderTicketDialog();
   });
 
+  /* --- タイトル: 枠が見えないので、右にペンマークを出して編集できることを示す --- */
+  const titleInput = h('input', {
+    type: 'text', class: 'title-input', value: t.title, maxLength: 200, title: 'クリックで編集',
+    onchange: guard(async (e) => {
+      const v = e.target.value.trim();
+      if (!v) { e.target.value = t.title; return; }
+      await setField(t.id, 'title', v);
+    }),
+  });
+  const titleWrap = h('div', { class: 'title-wrap' }, titleInput, h('button', {
+    type: 'button', class: 'edit-pen', title: 'タイトルを編集', tabIndex: -1,
+    onclick: () => { titleInput.focus(); titleInput.select(); },
+  }, penIcon()));
+
   dlg.className = 'dlg';
   setDialog(
     h('div', { class: 'dlg-head' },
@@ -2074,14 +2665,7 @@ function renderTicketDialog() {
       h('button', { class: 'btn ghost', onclick: () => dlg.close() }, '✕')),
     h('div', { class: 'ticket' },
       h('div', { class: 'ticket-main' },
-        h('input', {
-          type: 'text', class: 'title-input', value: t.title, maxLength: 200,
-          onchange: guard(async (e) => {
-            const v = e.target.value.trim();
-            if (!v) { e.target.value = t.title; return; }
-            await setField(t.id, 'title', v);
-          }),
-        }),
+        titleWrap,
         h('div', { class: 'section-title' }, '説明'),
         descBox,
 
@@ -2159,7 +2743,7 @@ function renderTicketDialog() {
         h('label', null, '種別'), select(c.types, t.type, change('type')),
         h('label', null, '優先度'), select(c.priorities, t.priority, change('priority')),
         h('label', null, '期限'), h('input', { type: 'date', value: t.due || '', onchange: change('due') }),
-        c.projects.length || t.project ? [h('label', null, 'プロジェクト'), select([['', '(なし)'], ...c.projects], t.project, change('project'))] : null,
+        activeProjects().length || t.project ? [h('label', null, 'プロジェクト'), select([['', '(なし)'], ...activeProjects()], t.project, change('project'))] : null,
         h('label', null, 'ラベル(カンマ区切り)'),
         labelInput,
         labelSuggest.length ? h('div', { class: 'label-suggest' }, h('span', { class: 'note' }, '候補:'),
@@ -2237,10 +2821,11 @@ function gateConnect(savedHandle) {
 async function start(root) {
   state.root = root;
   const sub = (name) => root.getDirectoryHandle(name, { create: true });
-  state.dirs = { tickets: await sub('tickets'), attachments: await sub('attachments'), users: await sub('users'), logs: await sub('logs') };
+  state.dirs = { tickets: await sub('tickets'), attachments: await sub('attachments'), users: await sub('users'), logs: await sub('logs'), templates: await sub('templates') };
   if (!(await loadConfig())) await writeJson(root, 'config.json', state.config);
   await registerUser();
   await loadUsers();
+  await loadTemplates();
   await withLock(syncTicketsRaw);
   loadSeen(lsGet('tb.mode') === 'demo' ? '(demo)' : root.name);
   log('access', '', `保存先: ${root.name}`);
