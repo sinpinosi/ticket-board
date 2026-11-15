@@ -2992,7 +2992,7 @@ const isReservedKey = (k) => ['Escape', 'Tab', ' ', 'ContextMenu', 'Backspace'].
 /** キーの名前(英字は大文字にそろえる。Shift の有無は区別しない) */
 const keyName = (e) => (e.key.length === 1 ? e.key.toUpperCase() : e.key);
 
-const keyLabel = (k) => k || 'なし';
+const keyLabel = (k) => k || '未割り当て';
 
 /** 今の割り当て {操作id: キー}('' は割り当てなし) */
 function shortcutKeys() {
@@ -3072,8 +3072,9 @@ function shortcutPanel() {
       btn.addEventListener('blur', onBlur);
       stopCapture = stop;
     };
+    // withHelp は [見出し, 説明] の配列を返すので展開する(replaceChildren は配列を展開しない)
     panel.replaceChildren(
-      withHelp('h2', 'キーボードショートカット', '「変更」を押してから、割り当てたいキーを押します(Esc で取り消し)。割り当てはこのブラウザだけに保存され、他のメンバーには影響しません。入力欄にカーソルがあるときは反応しません。'),
+      ...withHelp('h2', 'キーボードショートカット', '「変更」を押してから、割り当てたいキーを押します(Esc で取り消し)。「外す」で未割り当てにすると、そのキーを押してもこのアプリは何もしません(ブラウザの操作と重なるキーを外すときに使います)。割り当てはこのブラウザだけに保存され、他のメンバーには影響しません。入力欄にカーソルがあるときは反応しません。'),
       h('table', { class: 'shortcuts shortcut-edit' }, h('tbody', null,
         SHORTCUT_ACTIONS.map((x) => {
           const btn = h('button', { type: 'button', class: 'btn small', 'data-action': x.id }, '変更');
@@ -3082,10 +3083,18 @@ function shortcutPanel() {
             h('td', null, x.label),
             h('td', { class: 'nowrap' }, h('kbd', { class: keys[x.id] ? '' : 'none' }, keyLabel(keys[x.id]))),
             h('td', { class: 'nowrap' }, btn,
-              h('button', { type: 'button', class: 'btn small ghost', disabled: !keys[x.id], onclick: () => assign(x.id, '') }, 'なし')));
+              h('button', { type: 'button', class: 'btn small', 'data-unassign': x.id, disabled: !keys[x.id], title: 'このショートカットを未割り当てにする', onclick: () => assign(x.id, '') }, '外す')));
         }),
         FIXED_SHORTCUTS.map(([k, d]) => h('tr', null, h('td', null, d), h('td', { class: 'nowrap' }, h('kbd', null, k)), h('td', { class: 'note' }, '変更できません'))))),
       h('div', { class: 'toolbar' }, h('button', {
+        type: 'button', class: 'btn',
+        onclick: () => {
+          if (!confirm('ショートカットをすべて未割り当てにしますか?(Ctrl+Enter と Esc は残ります)')) return;
+          saveShortcutKeys(Object.fromEntries(SHORTCUT_ACTIONS.map((x) => [x.id, ''])));
+          render();
+          toast('ショートカットをすべて未割り当てにしました');
+        },
+      }, 'すべて外す'), h('button', {
         type: 'button', class: 'btn',
         onclick: () => {
           if (!confirm('ショートカットをすべて既定の割り当てに戻しますか?')) return;

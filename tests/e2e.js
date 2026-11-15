@@ -746,7 +746,20 @@ const URL_INDEX = pathToFileURL(path.join(__dirname, '..', 'index.html')).href;
   // 割り当て済みのキー(J = 次のチケット)を選ぶと、確認のうえ相手を外す
   await page.click('[data-testid=shortcut-panel] button[data-action=refresh]');
   await page.keyboard.press('j');
-  await page.waitForSelector('[data-testid=shortcut-panel] tr:has(button[data-action=next]) kbd:text-is("なし")');
+  await page.waitForSelector('[data-testid=shortcut-panel] tr:has(button[data-action=next]) kbd:text-is("未割り当て")');
+  // 見出しが文字で出ていること(配列を文字列にしてしまわない)
+  assert.strictEqual(await page.locator('[data-testid=shortcut-panel] h2').textContent(), 'キーボードショートカット?');
+  assert.ok(!(await page.innerText('[data-testid=shortcut-panel]')).includes('[object'), '[object …] と出ないこと');
+  // 「外す」で未割り当てにすると、そのキーでは何も起きない(? = 一覧)
+  await page.click('[data-testid=shortcut-panel] button[data-unassign=help]');
+  await page.waitForSelector('[data-testid=shortcut-panel] tr:has(button[data-action=help]) kbd:text-is("未割り当て")');
+  await page.locator('body').click({ position: { x: 5, y: 5 } });
+  await page.keyboard.press('?');
+  await page.waitForTimeout(200);
+  assert.strictEqual(await page.locator('#dlg[open]').count(), 0, '未割り当てのキーでは一覧を開かないこと');
+  await page.click('[data-testid=shortcut-panel] button[data-action=help]');
+  await page.keyboard.press('?');
+  await page.waitForSelector('[data-testid=shortcut-panel] tr:has(button[data-action=help]) kbd:text-is("?")');
   assert.ok(dialogs.at(-1).includes('「次のチケットを選ぶ'), `確認の文言: ${dialogs.at(-1)}`);
   await page.reload();
   await page.waitForSelector('#main');
