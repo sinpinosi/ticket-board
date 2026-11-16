@@ -8,3 +8,6 @@
 *.crswap
 
 node_modules/
+
+# 画像生成(Codex CLI)の作業ログ
+/.claude/.cc-writes/
